@@ -23,9 +23,6 @@ for pkg, mod in REQUIRED_PACKAGES.items():
     except ModuleNotFoundError:  # pragma: no cover - installation branch
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # Default env vars (can be overridden externally)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJh")
@@ -62,7 +59,7 @@ try:
 except Exception:  # pragma: no cover - dependency may be missing at runtime
     pybithumb = None
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
 KST = dt.timezone(dt.timedelta(hours=9))
 
 UPBIT_MIN_URL = "https://api.upbit.com/v1/candles/minutes/{unit}"
