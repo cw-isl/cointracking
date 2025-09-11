@@ -24,17 +24,12 @@ for pkg, mod in REQUIRED_PACKAGES.items():
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
 
-# Default env vars (can be overridden externally)
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJh")
+# Hardcoded Telegram bot token. Override with TELEGRAM_BOT_TOKEN env var if needed.
+BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN", "8203763129:AAH3AUckwP5nY-SZ9aVd-F6Rh6Jakb145SA"
+)
 os.environ.setdefault("BITHUMB_API_KEY", "YOUR_API_KEY")
 os.environ.setdefault("BITHUMB_API_SECRET", "YOUR_API_SECRET")
-
-# Extract commonly used tokens from the environment. "BOT_TOKEN" was previously
-# referenced later in the code but never defined, leading to a NameError when
-# attempting to start the bot. Reading the token once here ensures the constant
-# is available globally and can still be overridden by setting the environment
-# variable before execution.
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 import argparse
 import datetime as dt
