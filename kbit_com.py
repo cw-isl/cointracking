@@ -23,24 +23,6 @@ for pkg, mod in REQUIRED_PACKAGES.items():
     except ModuleNotFoundError:  # pragma: no cover - installation branch
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
-def load_env_file(path: str = ".env") -> None:
-    """Load environment variables from .env file supporting `export KEY=value` lines."""
-    p = Path(path)
-    if not p.exists():
-        return
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:]
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-load_env_file()
 
 # Default env vars (can be overridden externally)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJh")
@@ -77,9 +59,7 @@ try:
 except Exception:  # pragma: no cover - dependency may be missing at runtime
     pybithumb = None
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-if BOT_TOKEN.count(":") != 1:
-    raise RuntimeError("유효한 TELEGRAM_BOT_TOKEN이 설정되지 않았습니다. .env 또는 스크립트의 토큰 값을 확인하세요.")
+
 KST = dt.timezone(dt.timedelta(hours=9))
 
 UPBIT_MIN_URL = "https://api.upbit.com/v1/candles/minutes/{unit}"
