@@ -29,6 +29,13 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJh
 os.environ.setdefault("BITHUMB_API_KEY", "YOUR_API_KEY")
 os.environ.setdefault("BITHUMB_API_SECRET", "YOUR_API_SECRET")
 
+# Extract commonly used tokens from the environment. "BOT_TOKEN" was previously
+# referenced later in the code but never defined, leading to a NameError when
+# attempting to start the bot. Reading the token once here ensures the constant
+# is available globally and can still be overridden by setting the environment
+# variable before execution.
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
 import argparse
 import datetime as dt
 import logging
