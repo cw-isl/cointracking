@@ -505,7 +505,17 @@ def start_bot() -> None:
     app.add_handler(CommandHandler("hod", cmd_hod))
     app.add_error_handler(error_handler)
     logging.info("Bot started. Waiting for commands...")
-    app.run_polling()
+    try:
+        app.run_polling()
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopping...", exc_info=True)
+    finally:
+        app.stop()
+        try:
+            asyncio.run(app.shutdown())
+            asyncio.run(app.wait_closed())
+        except Exception:
+            logging.exception("Error during shutdown")
 
 
 def main() -> None:
