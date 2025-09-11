@@ -479,6 +479,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors raised during update handling."""
+    logging.error("Exception while handling an update:", exc_info=context.error)
+
+
 # ----- Main -----
 def start_bot() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
@@ -487,6 +492,7 @@ def start_bot() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("hod", cmd_hod))
+    app.add_error_handler(error_handler)
     logging.info("Bot started. Waiting for commands...")
     app.run_polling()
 
