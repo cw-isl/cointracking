@@ -26,7 +26,7 @@ for pkg, mod in REQUIRED_PACKAGES.items():
 
 # Hardcoded Telegram bot token. Override with TELEGRAM_BOT_TOKEN env var if needed.
 BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "8203763129:AAH3AUckwP5nY-SZ9aVd-F6Rh6Jakb145SA"
+    "TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJhLgs5tcQ7024"
 )
 os.environ.setdefault("BITHUMB_API_KEY", "YOUR_API_KEY")
 os.environ.setdefault("BITHUMB_API_SECRET", "YOUR_API_SECRET")
