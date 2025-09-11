@@ -2,9 +2,43 @@
 # -*- coding: utf-8 -*-
 """Telegram bot with menu-based coin analysis and simple Bithumb trading."""
 
+# ----- install dependencies & prepare environment -----
+import importlib
+import os
+import subprocess
+import sys
+
+REQUIRED_PACKAGES = {
+    "pandas": "pandas",
+    "requests": "requests",
+    "openpyxl": "openpyxl",
+    "python-dotenv": "dotenv",
+    "python-telegram-bot": "telegram",
+    "pybithumb": "pybithumb",
+}
+
+for pkg, mod in REQUIRED_PACKAGES.items():
+    try:
+        importlib.import_module(mod)
+    except ModuleNotFoundError:  # pragma: no cover - installation branch
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Default env vars (can be overridden externally)
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJh")
+os.environ.setdefault("BITHUMB_API_KEY", "YOUR_API_KEY")
+os.environ.setdefault("BITHUMB_API_SECRET", "YOUR_API_SECRET")
+
+import argparse
 import datetime as dt
+import logging
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -28,10 +62,12 @@ try:
 except Exception:  # pragma: no cover - dependency may be missing at runtime
     pybithumb = None
 
-BOT_TOKEN = "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJhLgs5tcQ7024"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 KST = dt.timezone(dt.timedelta(hours=9))
 
 UPBIT_MIN_URL = "https://api.upbit.com/v1/candles/minutes/{unit}"
+
+logging.basicConfig(level=logging.INFO)
 
 
 @dataclass
@@ -45,6 +81,181 @@ class TradeConfig:
     job_sell: Optional[object] = None
 
 trade_cfg = TradeConfig()
+
+# ----- HOD analysis utilities -----
+@dataclass
+class FetchConfig:
+    market: str = "KRW-ETC"
+    unit: int = 60
+    days: int = 300
+    pause: float = 0.13
+
+
+def kst_to_utc_str(ts: dt.datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=KST)
+    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fetch_candles(cfg: FetchConfig) -> pd.DataFrame:
+    target_rows = cfg.days * (24 * 60 // cfg.unit) + 200
+    url = UPBIT_MIN_URL.format(unit=cfg.unit)
+    frames: List[pd.DataFrame] = []
+    to_cursor: Optional[str] = None
+    collected = 0
+    while collected < target_rows:
+        params = {"market": cfg.market, "count": 200}
+        if to_cursor:
+            params["to"] = to_cursor
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            break
+        df = pd.DataFrame(data)
+        df = df.iloc[::-1].reset_index(drop=True)
+        frames.append(
+            df[["candle_date_time_kst", "opening_price", "high_price", "low_price", "trade_price"]].copy()
+        )
+        collected += len(df)
+        oldest_kst = pd.to_datetime(df["candle_date_time_kst"].iloc[0])
+        to_cursor = kst_to_utc_str(oldest_kst - dt.timedelta(minutes=cfg.unit))
+        time.sleep(cfg.pause)
+        if len(frames) > 4000:
+            break
+    if not frames:
+        return pd.DataFrame(columns=["ts_kst", "open", "high", "low", "close"])
+    out = pd.concat(frames, ignore_index=True).rename(
+        columns={
+            "candle_date_time_kst": "ts_kst",
+            "opening_price": "open",
+            "high_price": "high",
+            "low_price": "low",
+            "trade_price": "close",
+        }
+    )
+    out["ts_kst"] = pd.to_datetime(out["ts_kst"])
+    out = out.sort_values("ts_kst").reset_index(drop=True)
+    cutoff = out["ts_kst"].max() - pd.Timedelta(days=cfg.days)
+    out = out[out["ts_kst"] >= cutoff].reset_index(drop=True)
+    return out
+
+
+def parse_window(spec: str) -> Tuple[int, int]:
+    spec = spec.strip()
+    if "-" not in spec:
+        raise ValueError("시간창은 '시작-끝' 형식이어야 합니다. 예: 22-7")
+    a, b = spec.split("-", 1)
+    start = int(a)
+    end = int(b)
+    if not (0 <= start <= 23 and 0 <= end <= 23):
+        raise ValueError("시간은 0~23 사이 정수여야 합니다.")
+    return start, end
+
+
+def mask_window_hour(df: pd.DataFrame, col: str, start: int, end: int) -> pd.DataFrame:
+    h = df[col]
+    if start <= end:
+        return df[(h >= start) & (h <= end)]
+    return df[(h >= start) | (h <= end)]
+
+
+def find_best_hours(
+    df: pd.DataFrame, night_win: Tuple[int, int], morning_win: Tuple[int, int]
+) -> Tuple[int, int, float, float]:
+    tmp = df.copy()
+    tmp["hour"] = tmp["ts_kst"].dt.hour
+    night = mask_window_hour(tmp, "hour", *night_win)
+    morning = mask_window_hour(tmp, "hour", *morning_win)
+    if night.empty or morning.empty:
+        raise RuntimeError("시간대 필터 결과가 비어 있습니다.")
+    buy_series = night.groupby("hour")["low"].mean()
+    sell_series = morning.groupby("hour")["high"].mean()
+    buy_hour = int(buy_series.idxmin())
+    sell_hour = int(sell_series.idxmax())
+    return buy_hour, sell_hour, float(buy_series.min()), float(sell_series.max())
+
+
+def simulate_daily(df: pd.DataFrame, buy_hour: int, sell_hour: int, initial: float = 1_000_000.0) -> Tuple[float, int]:
+    d = df.copy().sort_values("ts_kst")
+    d["date"] = d["ts_kst"].dt.date
+    d["hour"] = d["ts_kst"].dt.hour
+    dates = sorted(d["date"].unique())
+    capital = float(initial)
+    trades = 0
+    for i in range(len(dates) - 1):
+        today, next_day = dates[i], dates[i + 1]
+        buy_row = d[(d["date"] == today) & (d["hour"] == buy_hour)]
+        sell_row = d[(d["date"] == next_day) & (d["hour"] == sell_hour)]
+        if buy_row.empty or sell_row.empty:
+            continue
+        buy_price = float(buy_row.iloc[0]["close"])
+        sell_price = float(sell_row.iloc[0]["close"])
+        if buy_price <= 0:
+            continue
+        qty = capital / buy_price
+        capital = qty * sell_price
+        trades += 1
+    return round(capital, 2), trades
+
+
+def to_excel(df: pd.DataFrame, outpath: Path):
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(outpath, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Raw")
+
+
+def analyze_hod(
+    market: str,
+    days: int,
+    unit: int,
+    night_spec: str,
+    morning_spec: str,
+    save_raw: Optional[str] = None,
+) -> str:
+    df = fetch_candles(FetchConfig(market=market, unit=unit, days=days))
+    if df.empty:
+        return "[ERROR] 데이터 수집 실패"
+    night = parse_window(night_spec)
+    morning = parse_window(morning_spec)
+    buy_hour, sell_hour, buy_mean_low, sell_mean_high = find_best_hours(df, night, morning)
+    final_capital, trades = simulate_daily(df, buy_hour, sell_hour, initial=1_000_000.0)
+    total_ret = (final_capital / 1_000_000.0 - 1.0) * 100.0
+    lines = [
+        f"[INFO] 수집: {market}, 최근 {days}일, {unit}분봉",
+        f"[RESULT] 매수 시간대(야간 {night_spec} 중 평균 저가 최저): {buy_hour}시 (평균 저가 {buy_mean_low:.4f})",
+        f"[RESULT] 매도 시간대(아침 {morning_spec} 중 평균 고가 최고): {sell_hour}시 (평균 고가 {sell_mean_high:.4f})",
+        f"[SIM] 거래 횟수: {trades}",
+        f"[SIM] 초기 1,000,000원 → 최종 {final_capital:,.2f}원 (누적 수익률 {total_ret:.2f}%)",
+    ]
+    if save_raw:
+        to_excel(df, Path(save_raw))
+        lines.append(f"[SAVE] Raw 저장: {save_raw}")
+    return "\n".join(lines)
+
+
+def run_hod_cli(market: str, days: int, unit: int, night_spec: str, morning_spec: str, save_raw: Optional[str] = None):
+    print(analyze_hod(market, days, unit, night_spec, morning_spec, save_raw=save_raw))
+
+
+def prompt_input() -> Tuple[str, int, int, str, str]:
+    m = input("마켓(예: KRW-ETC, KRW-BTC, KRW-ADA): ").strip().upper()
+    if not m.startswith("KRW-"):
+        m = f"KRW-{m}"
+    while True:
+        s = input("최근 N일 (기본 300): ").strip()
+        if not s:
+            d = 300
+            break
+        if s.isdigit() and int(s) > 0:
+            d = int(s)
+            break
+        print("양의 정수를 입력하세요.")
+    u = input("분봉 단위(기본 60): ").strip()
+    unit = int(u) if (u.isdigit() and int(u) > 0) else 60
+    night = input("야간창(기본 22-7): ").strip() or "22-7"
+    morning = input("아침창(기본 7-12): ").strip() or "7-12"
+    return m, d, unit, night, morning
 
 # ----- Conversation state keys -----
 STATE = "state"
@@ -65,7 +276,7 @@ def parse_time_str(t: str) -> dt.time:
     return dt.time(int(t[:2]), int(t[2:]), tzinfo=KST)
 
 
-def fetch_candles(market: str, start: dt.datetime, end: dt.datetime, unit: int) -> pd.DataFrame:
+def fetch_candles_range(market: str, start: dt.datetime, end: dt.datetime, unit: int) -> pd.DataFrame:
     url = UPBIT_MIN_URL.format(unit=unit)
     results: List[Dict[str, object]] = []
     to = end
@@ -108,8 +319,8 @@ async def perform_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             end_night = dt.datetime.combine(d, dt.time(7, 0, tzinfo=KST))
             start_morn = dt.datetime.combine(d, dt.time(7, 0, tzinfo=KST))
             end_morn = dt.datetime.combine(d, dt.time(12, 0, tzinfo=KST))
-            df_night = fetch_candles(market, start_night, end_night, unit)
-            df_morn = fetch_candles(market, start_morn, end_morn, unit)
+            df_night = fetch_candles_range(market, start_night, end_night, unit)
+            df_morn = fetch_candles_range(market, start_morn, end_morn, unit)
             if df_night.empty or df_morn.empty:
                 continue
             min_row = df_night.loc[df_night["price"].idxmin()]
@@ -131,6 +342,20 @@ async def perform_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await update.message.reply_document(InputFile(filename))
     if summary_lines:
         await update.message.reply_text("\n".join(summary_lines))
+
+
+async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    market = args[0] if len(args) > 0 else "KRW-ETC"
+    days = int(args[1]) if len(args) > 1 else 300
+    unit = int(args[2]) if len(args) > 2 else 60
+    night = args[3] if len(args) > 3 else "22-7"
+    morning = args[4] if len(args) > 4 else "7-12"
+    try:
+        result = analyze_hod(market, days, unit, night, morning)
+    except Exception as e:
+        result = f"[ERROR] {e}"
+    await update.message.reply_text(result)
 
 
 # ----- Menu and conversation handlers -----
@@ -249,19 +474,49 @@ async def cmd_stoptrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "1. /bts 명령으로 메뉴를 연 후 원하는 기능을 선택하세요.\n"
-        "2. 각 기능은 안내에 따라 정보를 입력하면 됩니다."
+        "1. /start 또는 /bts 명령으로 메뉴를 연 후 원하는 기능을 선택하세요.\n"
+        "2. 각 기능은 안내에 따라 정보를 입력하면 됩니다.\n"
+        "3. /hod [티커] [일수] [분봉] [야간] [아침] 명령으로 HOD 분석을 실행합니다."
     )
 
 
 # ----- Main -----
-def main() -> None:
+def start_bot() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("bts", cmd_bts))
+    app.add_handler(CommandHandler(["bts", "start"], cmd_bts))
     app.add_handler(CallbackQueryHandler(menu_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("hod", cmd_hod))
+    logging.info("Bot started. Waiting for commands...")
     app.run_polling()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Telegram bot and HOD analysis")
+    ap.add_argument("--bot", action="store_true", help="Run Telegram bot")
+    ap.add_argument("--market", type=str, help="마켓 티커 (예: KRW-ETC)")
+    ap.add_argument("--days", type=int, help="최근 N일 (기본 300)")
+    ap.add_argument("--unit", type=int, default=60, help="분봉 단위(기본 60)")
+    ap.add_argument("--night", type=str, default="22-7", help="야간창 (기본 22-7)")
+    ap.add_argument("--morning", type=str, default="7-12", help="아침창 (기본 7-12)")
+    ap.add_argument("--save-raw", type=str, default=None, help="Raw 저장 경로(excel). 지정 시 저장")
+    ap.add_argument("--interactive", action="store_true", help="프롬프트로 입력 받기")
+    args = ap.parse_args()
+    if args.bot or not (args.market and args.days) and not args.interactive:
+        start_bot()
+        return
+    if args.interactive or not (args.market and args.days):
+        market, days, unit, night, morning = prompt_input()
+    else:
+        market = args.market.upper()
+        if not market.startswith("KRW-"):
+            market = "KRW-" + market
+        days = args.days if args.days else 300
+        unit = args.unit
+        night = args.night
+        morning = args.morning
+    run_hod_cli(market, days, unit, night, morning, save_raw=args.save_raw)
 
 
 if __name__ == "__main__":
