@@ -32,6 +32,7 @@ os.environ.setdefault("BITHUMB_API_KEY", "YOUR_API_KEY")
 os.environ.setdefault("BITHUMB_API_SECRET", "YOUR_API_SECRET")
 
 import argparse
+import asyncio
 import datetime as dt
 import logging
 import time
@@ -307,8 +308,10 @@ def fetch_candles_range(market: str, start: dt.datetime, end: dt.datetime, unit:
     return df
 
 
-async def perform_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, tickers: List[str], days: int, unit: int) -> None:
-    summary_lines = []
+def perform_analysis_sync(tickers: List[str], days: int, unit: int) -> Tuple[List[str], List[str]]:
+    """Perform analysis synchronously and return summary lines and file paths."""
+    summaries: List[str] = []
+    files: List[str] = []
     for t in tickers:
         market = t if t.startswith("KRW-") else f"KRW-{t}"
         rows = []
@@ -333,14 +336,21 @@ async def perform_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             })
         df = pd.DataFrame(rows)
         if df.empty:
-            summary_lines.append(f"{t}: no data")
+            summaries.append(f"{t}: no data")
             continue
         filename = f"analysis_{t}_{days}d_{unit}m.xlsx"
         df.to_excel(filename, index=False)
-        summary_lines.append(f"{t}: 저장 {filename} (rows={len(df)})")
-        await update.message.reply_document(InputFile(filename))
-    if summary_lines:
-        await update.message.reply_text("\n".join(summary_lines))
+        summaries.append(f"{t}: 저장 {filename} (rows={len(df)})")
+        files.append(filename)
+    return summaries, files
+
+
+async def perform_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, tickers: List[str], days: int, unit: int) -> None:
+    summaries, files = await asyncio.to_thread(perform_analysis_sync, tickers, days, unit)
+    for fpath in files:
+        await update.message.reply_document(InputFile(fpath))
+    if summaries:
+        await update.message.reply_text("\n".join(summaries))
 
 
 async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,7 +419,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         tickers = context.user_data.pop("tickers")
         days = context.user_data.pop("days")
         context.user_data.pop(STATE, None)
-        await perform_analysis(update, context, tickers, days, int(text))
+        await update.message.reply_text("분석을 시작합니다. 완료되면 결과를 보내 드릴게요.")
+        asyncio.create_task(perform_analysis(update, context, tickers, days, int(text)))
     elif state == API_KEY:
         context.user_data["api_key"] = text
         await update.message.reply_text("API 시크릿을 입력하세요")
