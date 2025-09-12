@@ -171,8 +171,6 @@ async def fetch_minute_candles(
         dfs.append(df[["time_kst", "close"]])
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
-
-in
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
     out = pd.concat(dfs, ignore_index=True)
