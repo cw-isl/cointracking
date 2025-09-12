@@ -24,6 +24,7 @@
 
 import asyncio
 import datetime as dt
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -182,10 +183,11 @@ async def fetch_minute_candles(
 async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         markets = await fetch_markets(session)
+        min_days = max(10, math.ceil(period_days * 0.5))
         rows = []
         for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
-            if len(df) < 10:
+            if len(df) < min_days:
                 await asyncio.sleep(0.15)
                 continue
             vol = (df["close"] - df["open"]).abs() / df["open"]
@@ -199,10 +201,11 @@ async def calc_top_volatility(period_days: int) -> pd.DataFrame:
 async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         markets = await fetch_markets(session)
+        min_days = max(10, math.ceil(period_days * 0.5))
         rows = []
         for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
-            if len(df) < 10:
+            if len(df) < min_days:
                 await asyncio.sleep(0.15)
                 continue
             rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
