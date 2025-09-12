@@ -50,6 +50,7 @@ ALLOWED_USER_IDS: List[int] = []  # 예: [5517670242]
 
 # Upbit API
 UPBIT_BASE = "https://api.upbit.com"
+API_REQUEST_DELAY = 0.15  # seconds between Upbit API calls
 
 # 기본 백테스트 설정
 DEFAULT_BUY_WINDOW = ("19:00", "01:00")  # (시작, 끝) 끝이 익일 가능
@@ -171,42 +172,40 @@ async def fetch_minute_candles(
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
 
-        # 과호출 방지: 모든 요청 사이에 짧은 지연(0.15초)
-        await asyncio.sleep(0.15)
+        # 과호출 방지: 모든 요청 사이에 짧은 지연
+        await asyncio.sleep(API_REQUEST_DELAY)
 
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
     out = pd.concat(dfs, ignore_index=True)
     return out.sort_values("time_kst")
 
+async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
+    """Yield (market, daily_df) for KRW markets with enough history."""
+    markets = await fetch_markets(session)
+    min_days = max(10, math.ceil(period_days * 0.5))
+    for m in markets:
+        df = await fetch_daily_candles(session, m, period_days)
+        if len(df) >= min_days:
+            yield m, df
+        await asyncio.sleep(API_REQUEST_DELAY)
+
 # ========== 계산 로직 ==========
 async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
-        markets = await fetch_markets(session)
-        min_days = max(10, math.ceil(period_days * 0.5))
         rows = []
-        for m in markets:
-            df = await fetch_daily_candles(session, m, period_days)
-            if len(df) >= min_days:
-                vol = (df["close"] - df["open"]).abs() / df["open"]
-                rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
-            # 모든 호출 사이에 0.15초 지연을 두어 초당 10회 제한 준수
-            await asyncio.sleep(0.15)
+        async for m, df in iter_markets_daily(session, period_days):
+            vol = (df["close"] - df["open"]).abs() / df["open"]
+            rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
         out = pd.DataFrame(rows)
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
 
 async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
-        markets = await fetch_markets(session)
-        min_days = max(10, math.ceil(period_days * 0.5))
         rows = []
-        for m in markets:
-            df = await fetch_daily_candles(session, m, period_days)
-            if len(df) >= min_days:
-                rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
-            # 모든 호출 사이에 0.15초 지연을 두어 초당 10회 제한 준수
-            await asyncio.sleep(0.15)
+        async for m, df in iter_markets_daily(session, period_days):
+            rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
         out = pd.DataFrame(rows)
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
