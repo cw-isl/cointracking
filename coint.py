@@ -172,9 +172,7 @@ async def fetch_minute_candles(
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
 
-        # 과호출 방지: 모든 요청 사이에 짧은 지연
-        await asyncio.sleep(API_REQUEST_DELAY)
-
+in
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
     out = pd.concat(dfs, ignore_index=True)
@@ -183,10 +181,6 @@ async def fetch_minute_candles(
 async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
     """Yield (market, daily_df) for KRW markets with enough history."""
     markets = await fetch_markets(session)
-    effective_days = min(period_days, MAX_CANDLE_COUNT)
-    min_days = max(10, math.ceil(effective_days * 0.5))
-    for m in markets:
-        df = await fetch_daily_candles(session, m, effective_days)
         if len(df) >= min_days:
             yield m, df
         await asyncio.sleep(API_REQUEST_DELAY)
@@ -195,23 +189,14 @@ async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
 async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         rows = []
-        async for m, df in iter_markets_daily(session, period_days):
-            vol = (df["close"] - df["open"]).abs() / df["open"]
-            rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
-        out = pd.DataFrame(rows, columns=["market", "mean_oc_volatility_pct"])
-        if out.empty:
-            return out
+
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
 
 async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         rows = []
-        async for m, df in iter_markets_daily(session, period_days):
-            rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
-        out = pd.DataFrame(rows, columns=["market", "mean_daily_value_krw"])
-        if out.empty:
-            return out
+
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
 
