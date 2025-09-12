@@ -24,6 +24,7 @@
 
 import asyncio
 import datetime as dt
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -49,6 +50,7 @@ ALLOWED_USER_IDS: List[int] = []  # 예: [5517670242]
 
 # Upbit API
 UPBIT_BASE = "https://api.upbit.com"
+API_REQUEST_DELAY = 0.15  # seconds between Upbit API calls
 
 # 기본 백테스트 설정
 DEFAULT_BUY_WINDOW = ("19:00", "01:00")  # (시작, 끝) 끝이 익일 가능
@@ -100,9 +102,17 @@ def kst_now() -> dt.datetime:
 
 # ========== Upbit API ==========
 async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict=None):
-    async with session.get(url, params=params, timeout=30) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    """GET 요청을 보내고 JSON을 반환한다.
+    429(Too Many Requests) 발생 시 잠시 대기 후 최대 5회까지 재시도한다.
+    """
+    for _ in range(5):
+        async with session.get(url, params=params, timeout=30) as resp:
+            if resp.status == 429:
+                await asyncio.sleep(1)
+                continue
+            resp.raise_for_status()
+            return await resp.json()
+    raise RuntimeError("Too Many Requests: repeated 429 responses")
 
 async def fetch_markets(session: aiohttp.ClientSession) -> List[str]:
     url = f"{UPBIT_BASE}/v1/market/all"
@@ -162,43 +172,46 @@ async def fetch_minute_candles(
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
 
-        # 과호출 방지 살짝 쉼
-        await asyncio.sleep(0.12)
+        # 과호출 방지: 모든 요청 사이에 짧은 지연
+        await asyncio.sleep(API_REQUEST_DELAY)
 
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
     out = pd.concat(dfs, ignore_index=True)
     return out.sort_values("time_kst")
 
+async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
+    """Yield (market, daily_df) for KRW markets with enough history."""
+    markets = await fetch_markets(session)
+    effective_days = min(period_days, MAX_CANDLE_COUNT)
+    min_days = max(10, math.ceil(effective_days * 0.5))
+    for m in markets:
+        df = await fetch_daily_candles(session, m, effective_days)
+        if len(df) >= min_days:
+            yield m, df
+        await asyncio.sleep(API_REQUEST_DELAY)
+
 # ========== 계산 로직 ==========
 async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
-        markets = await fetch_markets(session)
         rows = []
-        for i, m in enumerate(markets):
-            df = await fetch_daily_candles(session, m, period_days)
-            if len(df) < 10:
-                continue
+        async for m, df in iter_markets_daily(session, period_days):
             vol = (df["close"] - df["open"]).abs() / df["open"]
             rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
-            if i % 10 == 0:
-                await asyncio.sleep(0.05)
-        out = pd.DataFrame(rows)
+        out = pd.DataFrame(rows, columns=["market", "mean_oc_volatility_pct"])
+        if out.empty:
+            return out
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
 
 async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
-        markets = await fetch_markets(session)
         rows = []
-        for i, m in enumerate(markets):
-            df = await fetch_daily_candles(session, m, period_days)
-            if len(df) < 10:
-                continue
+        async for m, df in iter_markets_daily(session, period_days):
             rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
-            if i % 10 == 0:
-                await asyncio.sleep(0.05)
-        out = pd.DataFrame(rows)
+        out = pd.DataFrame(rows, columns=["market", "mean_daily_value_krw"])
+        if out.empty:
+            return out
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
 
@@ -379,6 +392,9 @@ async def on_q1_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try:
         period = int(update.message.text.strip())
+        if period > MAX_CANDLE_COUNT:
+            period = MAX_CANDLE_COUNT
+            await update.message.reply_text("Upbit API 한계로 200일까지만 조회합니다.")
         await update.message.reply_text("계산 중입니다. 잠시만요…")
         df = await calc_top_volatility(period)
         if df.empty:
@@ -399,6 +415,9 @@ async def on_q2_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try:
         period = int(update.message.text.strip())
+        if period > MAX_CANDLE_COUNT:
+            period = MAX_CANDLE_COUNT
+            await update.message.reply_text("Upbit API 한계로 200일까지만 조회합니다.")
         await update.message.reply_text("계산 중입니다. 잠시만요…")
         df = await calc_top_value(period)
         if df.empty:
@@ -532,7 +551,9 @@ def build_app():
 def main():
     app = build_app()
     # PTB v21 권장: 한 줄로 시작/대기까지 처리
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # 다른 인스턴스가 남아있을 때 발생하는 409 오류를 방지하기 위해
+    # 기존 웹훅/업데이트를 정리(drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
