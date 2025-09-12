@@ -1,0 +1,5 @@
+python-telegram-bot==21.4
+aiohttp>=3.9
+pandas>=2.2
+numpy>=1.26
+pytz>=2024.1
