@@ -172,6 +172,7 @@ async def fetch_minute_candles(
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
 
+in
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
     out = pd.concat(dfs, ignore_index=True)
@@ -180,9 +181,6 @@ async def fetch_minute_candles(
 async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
     """Yield (market, daily_df) for KRW markets with enough history."""
     markets = await fetch_markets(session)
-    min_days = max(10, math.ceil(period_days * 0.5))
-    for m in markets:
-        df = await fetch_daily_candles(session, m, period_days)
         if len(df) >= min_days:
             yield m, df
         await asyncio.sleep(API_REQUEST_DELAY)
@@ -192,15 +190,13 @@ async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         rows = []
 
-        out = pd.DataFrame(rows)
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
 
 async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         rows = []
-        
-        out = pd.DataFrame(rows)
+
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
 
@@ -381,6 +377,9 @@ async def on_q1_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try:
         period = int(update.message.text.strip())
+        if period > MAX_CANDLE_COUNT:
+            period = MAX_CANDLE_COUNT
+            await update.message.reply_text("Upbit API 한계로 200일까지만 조회합니다.")
         await update.message.reply_text("계산 중입니다. 잠시만요…")
         df = await calc_top_volatility(period)
         if df.empty:
@@ -401,6 +400,9 @@ async def on_q2_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try:
         period = int(update.message.text.strip())
+        if period > MAX_CANDLE_COUNT:
+            period = MAX_CANDLE_COUNT
+            await update.message.reply_text("Upbit API 한계로 200일까지만 조회합니다.")
         await update.message.reply_text("계산 중입니다. 잠시만요…")
         df = await calc_top_value(period)
         if df.empty:
