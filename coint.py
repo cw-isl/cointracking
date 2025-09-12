@@ -100,9 +100,17 @@ def kst_now() -> dt.datetime:
 
 # ========== Upbit API ==========
 async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict=None):
-    async with session.get(url, params=params, timeout=30) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    """GET 요청을 보내고 JSON을 반환한다.
+    429(Too Many Requests) 발생 시 잠시 대기 후 최대 5회까지 재시도한다.
+    """
+    for _ in range(5):
+        async with session.get(url, params=params, timeout=30) as resp:
+            if resp.status == 429:
+                await asyncio.sleep(1)
+                continue
+            resp.raise_for_status()
+            return await resp.json()
+    raise RuntimeError("Too Many Requests: repeated 429 responses")
 
 async def fetch_markets(session: aiohttp.ClientSession) -> List[str]:
     url = f"{UPBIT_BASE}/v1/market/all"
@@ -162,8 +170,8 @@ async def fetch_minute_candles(
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
 
-        # 과호출 방지 살짝 쉼
-        await asyncio.sleep(0.12)
+        # 과호출 방지: 모든 요청 사이에 짧은 지연(0.15초)
+        await asyncio.sleep(0.15)
 
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
@@ -175,14 +183,15 @@ async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         markets = await fetch_markets(session)
         rows = []
-        for i, m in enumerate(markets):
+        for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
             if len(df) < 10:
+                await asyncio.sleep(0.15)
                 continue
             vol = (df["close"] - df["open"]).abs() / df["open"]
             rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
-            if i % 10 == 0:
-                await asyncio.sleep(0.05)
+            # 모든 호출 사이에 0.15초 지연을 두어 초당 10회 제한 준수
+            await asyncio.sleep(0.15)
         out = pd.DataFrame(rows)
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
@@ -191,13 +200,14 @@ async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         markets = await fetch_markets(session)
         rows = []
-        for i, m in enumerate(markets):
+        for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
             if len(df) < 10:
+                await asyncio.sleep(0.15)
                 continue
             rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
-            if i % 10 == 0:
-                await asyncio.sleep(0.05)
+            # 모든 호출 사이에 0.15초 지연을 두어 초당 10회 제한 준수
+            await asyncio.sleep(0.15)
         out = pd.DataFrame(rows)
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
@@ -532,7 +542,9 @@ def build_app():
 def main():
     app = build_app()
     # PTB v21 권장: 한 줄로 시작/대기까지 처리
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # 다른 인스턴스가 남아있을 때 발생하는 409 오류를 방지하기 위해
+    # 기존 웹훅/업데이트를 정리(drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
