@@ -162,8 +162,8 @@ async def fetch_minute_candles(
         cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
         remain -= len(df)
 
-        # 과호출 방지 살짝 쉼
-        await asyncio.sleep(0.12)
+        # 과호출 방지: 초당 0.2회(5초 간격)로 제한
+        await asyncio.sleep(5)
 
     if not dfs:
         return pd.DataFrame(columns=["time_kst", "close"])
@@ -175,14 +175,15 @@ async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         markets = await fetch_markets(session)
         rows = []
-        for i, m in enumerate(markets):
+        for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
             if len(df) < 10:
+                await asyncio.sleep(5)
                 continue
             vol = (df["close"] - df["open"]).abs() / df["open"]
             rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
-            if i % 10 == 0:
-                await asyncio.sleep(0.05)
+            # 초당 0.2회(5초 간격)로 요청 제한
+            await asyncio.sleep(5)
         out = pd.DataFrame(rows)
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
@@ -191,13 +192,14 @@ async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
         markets = await fetch_markets(session)
         rows = []
-        for i, m in enumerate(markets):
+        for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
             if len(df) < 10:
+                await asyncio.sleep(5)
                 continue
             rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
-            if i % 10 == 0:
-                await asyncio.sleep(0.05)
+            # 초당 0.2회(5초 간격)로 요청 제한
+            await asyncio.sleep(5)
         out = pd.DataFrame(rows)
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
