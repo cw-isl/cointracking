@@ -1,549 +1,538 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram bot with menu-based coin analysis and simple Bithumb trading."""
+"""
+텔레그램 - 우분투 - 코인 분석기 (Upbit 공용 API 기반)
+기능:
+  1) 변동성 상위 Top10 (기간: 200/300일 등)
+  2) 거래액(원화) Top10 (기간: 200/300일 등)
+  3) 일일단가 수익률 비교 백테스트:
+     - 종목 (예: KRW-BTC)
+     - 조회기간(일)
+     - 매입 시간대 (기본: 19:00~익일 01:00)
+     - 매각 시간대 (기본: 익일 08:00~익일 12:00)
+     - 분봉(1/3/5/10/15/30/60/240)
+     - 기간 동안 평균적으로 '가장 싼 시간(매입)'과 '가장 비싼 시간(매도)'을 각 시간대에서 찾고,
+       매일 100만원을 동일 시간에 사고/팔았다면 결과(고정 예산 합산 vs 매일 재투자 복리)를 계산
+명령:
+  /bts  : 메뉴 시작 (선택형)
+  /start: 안내
 
-# ----- install dependencies & prepare environment -----
-import importlib
-import os
-import subprocess
-import sys
+주의:
+  - Upbit 공개 API 사용(무인증), 과도한 호출 방지.
+  - 시간대는 Asia/Seoul 기준.
+"""
 
-REQUIRED_PACKAGES = {
-    "pandas": "pandas",
-    "requests": "requests",
-    "openpyxl": "openpyxl",
-    "python-dotenv": "dotenv",
-    "python-telegram-bot": "telegram",
-    "pybithumb": "pybithumb",
-}
-
-for pkg, mod in REQUIRED_PACKAGES.items():
-    try:
-        importlib.import_module(mod)
-    except ModuleNotFoundError:  # pragma: no cover - installation branch
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-
-# Hardcoded Telegram bot token. Override with TELEGRAM_BOT_TOKEN env var if needed.
-BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJhLgs5tcQ7024"
-)
-os.environ.setdefault("BITHUMB_API_KEY", "YOUR_API_KEY")
-os.environ.setdefault("BITHUMB_API_SECRET", "YOUR_API_SECRET")
-
-import argparse
 import asyncio
 import datetime as dt
-import logging
-import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple, Optional, Dict
 
+import aiohttp
 import pandas as pd
-import requests
+import numpy as np
+import pytz
+
 from telegram import (
-    Update,
-    InputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 )
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
+    ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler,
+    CallbackQueryHandler, MessageHandler, filters
 )
 
-try:
-    import pybithumb
-except Exception:  # pragma: no cover - dependency may be missing at runtime
-    pybithumb = None
+# ========= 통합 설정 (여기만 수정하면 됨) =========
+TOKEN = "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJhLgs5tcQ7024"  # 요청하신 대로 하드코딩
+TZ = pytz.timezone("Asia/Seoul")
 
+# 텔레그램 접근 제어: 특정 사용자만 사용하려면 ID를 적으세요. 비우면 전체 허용.
+ALLOWED_USER_IDS: List[int] = []  # 예: [5517670242]
 
-KST = dt.timezone(dt.timedelta(hours=9))
+# Upbit API
+UPBIT_BASE = "https://api.upbit.com"
 
-UPBIT_MIN_URL = "https://api.upbit.com/v1/candles/minutes/{unit}"
+# 기본 백테스트 설정
+DEFAULT_BUY_WINDOW = ("19:00", "01:00")  # (시작, 끝) 끝이 익일 가능
+DEFAULT_SELL_WINDOW = ("08:00", "12:00")  # (시작, 끝) 동일/익일 가능
+DEFAULT_INTERVAL_MIN = 5
+DEFAULT_BUDGET = 1_000_000  # 원
+MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
 
-logging.basicConfig(level=logging.INFO)
+# ========== 내부 상태키 ==========
+(
+    MENU,                # 루트 메뉴
+    Q1_PERIOD,           # 기능1: 변동성 기간
+    Q2_PERIOD,           # 기능2: 거래액 기간
+    Q3_SYMBOL,           # 기능3: 종목
+    Q3_PERIOD,           # 기능3: 기간
+    Q3_BUY_WINDOW,       # 기능3: 매입 시간대
+    Q3_SELL_WINDOW,      # 기능3: 매도 시간대
+    Q3_INTERVAL          # 기능3: 분봉
+) = range(8)
 
+# ========== 유틸 ==========
+def user_allowed(user_id: int) -> bool:
+    return (not ALLOWED_USER_IDS) or (user_id in ALLOWED_USER_IDS)
 
-@dataclass
-class TradeConfig:
-    api_key: str = ""
-    api_secret: str = ""
-    percent: float = 0.0
-    buy_time: str = ""
-    sell_time: str = ""
-    job_buy: Optional[object] = None
-    job_sell: Optional[object] = None
+def parse_hhmm(s: str) -> dt.time:
+    return dt.datetime.strptime(s.strip(), "%H:%M").time()
 
-trade_cfg = TradeConfig()
+def time_range_minutes(start: dt.time, end: dt.time) -> List[int]:
+    """
+    분 단위 '하루 내 offset(0~1439)' 배열 생성. 종료가 익일이면 그 구간을 이어붙인다.
+    """
+    def to_min(t: dt.time) -> int:
+        return t.hour * 60 + t.minute
 
-# ----- HOD analysis utilities -----
-@dataclass
-class FetchConfig:
-    market: str = "KRW-ETC"
-    unit: int = 60
-    days: int = 300
-    pause: float = 0.13
+    s = to_min(start)
+    e = to_min(end)
+    if s <= e:
+        return list(range(s, e + 1))
+    else:
+        return list(range(s, 24*60)) + list(range(0, e + 1))
 
-
-def kst_to_utc_str(ts: dt.datetime) -> str:
+def localize(ts: dt.datetime) -> dt.datetime:
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=KST)
-    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return TZ.localize(ts)
+    return ts.astimezone(TZ)
 
+def kst_now() -> dt.datetime:
+    return dt.datetime.now(tz=TZ)
 
-def fetch_candles(cfg: FetchConfig) -> pd.DataFrame:
-    target_rows = cfg.days * (24 * 60 // cfg.unit) + 200
-    url = UPBIT_MIN_URL.format(unit=cfg.unit)
-    frames: List[pd.DataFrame] = []
-    to_cursor: Optional[str] = None
-    collected = 0
-    while collected < target_rows:
-        params = {"market": cfg.market, "count": 200}
-        if to_cursor:
-            params["to"] = to_cursor
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+# ========== Upbit API ==========
+async def http_get_json(session: aiohttp.ClientSession, url: str, params: dict=None):
+    async with session.get(url, params=params, timeout=30) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+async def fetch_markets(session: aiohttp.ClientSession) -> List[str]:
+    url = f"{UPBIT_BASE}/v1/market/all"
+    data = await http_get_json(session, url, {"isDetails": "true"})
+    markets = [d["market"] for d in data if d["market"].startswith("KRW-")]
+    return markets
+
+async def fetch_daily_candles(session: aiohttp.ClientSession, market: str, count: int) -> pd.DataFrame:
+    url = f"{UPBIT_BASE}/v1/candles/days"
+    data = await http_get_json(session, url, {"market": market, "count": min(count, MAX_CANDLE_COUNT)})
+    # 최근 -> 과거 순으로 내려옴
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    # 표준화
+    df["date_kst"] = pd.to_datetime(df["candle_date_time_kst"])
+    df["date_kst"] = df["date_kst"].dt.tz_localize("Asia/Seoul")
+    df.rename(columns={
+        "opening_price": "open",
+        "trade_price": "close",
+        "high_price": "high",
+        "low_price": "low",
+        "candle_acc_trade_price": "value_krw",
+        "candle_acc_trade_volume": "volume"
+    }, inplace=True)
+    keep = ["date_kst", "open", "close", "high", "low", "value_krw", "volume"]
+    return df[keep].sort_values("date_kst")
+
+async def fetch_minute_candles(
+    session: aiohttp.ClientSession, market: str, unit: int, end_time_kst: dt.datetime, need: int
+) -> pd.DataFrame:
+    """
+    분봉 데이터를 끝 시각 기준으로 MAX_CANDLE_COUNT씩 당겨오며 need개 이상 확보.
+    Upbit는 최근→과거 순으로 반환하므로 적절히 정렬.
+    """
+    url = f"{UPBIT_BASE}/v1/candles/minutes/{unit}"
+    dfs = []
+    remain = need
+    cursor = end_time_kst
+
+    while remain > 0:
+        params = {
+            "market": market,
+            "count": min(MAX_CANDLE_COUNT, remain),
+            "to": cursor.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        data = await http_get_json(session, url, params)
         if not data:
             break
         df = pd.DataFrame(data)
-        df = df.iloc[::-1].reset_index(drop=True)
-        frames.append(
-            df[["candle_date_time_kst", "opening_price", "high_price", "low_price", "trade_price"]].copy()
-        )
-        collected += len(df)
-        oldest_kst = pd.to_datetime(df["candle_date_time_kst"].iloc[0])
-        to_cursor = kst_to_utc_str(oldest_kst - dt.timedelta(minutes=cfg.unit))
-        time.sleep(cfg.pause)
-        if len(frames) > 4000:
-            break
-    if not frames:
-        return pd.DataFrame(columns=["ts_kst", "open", "high", "low", "close"])
-    out = pd.concat(frames, ignore_index=True).rename(
-        columns={
-            "candle_date_time_kst": "ts_kst",
-            "opening_price": "open",
-            "high_price": "high",
-            "low_price": "low",
-            "trade_price": "close",
-        }
-    )
-    out["ts_kst"] = pd.to_datetime(out["ts_kst"])
-    out = out.sort_values("ts_kst").reset_index(drop=True)
-    cutoff = out["ts_kst"].max() - pd.Timedelta(days=cfg.days)
-    out = out[out["ts_kst"] >= cutoff].reset_index(drop=True)
-    return out
+        df["time_kst"] = pd.to_datetime(df["candle_date_time_kst"])
+        df["time_kst"] = df["time_kst"].dt.tz_localize("Asia/Seoul")
+        df.rename(columns={
+            "trade_price": "close"
+        }, inplace=True)
+        dfs.append(df[["time_kst", "close"]])
+        cursor = df["time_kst"].iloc[-1] - dt.timedelta(seconds=unit*60)  # 다음 요청 anchor
+        remain -= len(df)
 
+        # 과호출 방지 살짝 쉼
+        await asyncio.sleep(0.12)
 
-def parse_window(spec: str) -> Tuple[int, int]:
-    spec = spec.strip()
-    if "-" not in spec:
-        raise ValueError("시간창은 '시작-끝' 형식이어야 합니다. 예: 22-7")
-    a, b = spec.split("-", 1)
-    start = int(a)
-    end = int(b)
-    if not (0 <= start <= 23 and 0 <= end <= 23):
-        raise ValueError("시간은 0~23 사이 정수여야 합니다.")
-    return start, end
+    if not dfs:
+        return pd.DataFrame(columns=["time_kst", "close"])
+    out = pd.concat(dfs, ignore_index=True)
+    return out.sort_values("time_kst")
 
-
-def mask_window_hour(df: pd.DataFrame, col: str, start: int, end: int) -> pd.DataFrame:
-    h = df[col]
-    if start <= end:
-        return df[(h >= start) & (h <= end)]
-    return df[(h >= start) | (h <= end)]
-
-
-def find_best_hours(
-    df: pd.DataFrame, night_win: Tuple[int, int], morning_win: Tuple[int, int]
-) -> Tuple[int, int, float, float]:
-    tmp = df.copy()
-    tmp["hour"] = tmp["ts_kst"].dt.hour
-    night = mask_window_hour(tmp, "hour", *night_win)
-    morning = mask_window_hour(tmp, "hour", *morning_win)
-    if night.empty or morning.empty:
-        raise RuntimeError("시간대 필터 결과가 비어 있습니다.")
-    buy_series = night.groupby("hour")["low"].mean()
-    sell_series = morning.groupby("hour")["high"].mean()
-    buy_hour = int(buy_series.idxmin())
-    sell_hour = int(sell_series.idxmax())
-    return buy_hour, sell_hour, float(buy_series.min()), float(sell_series.max())
-
-
-def simulate_daily(df: pd.DataFrame, buy_hour: int, sell_hour: int, initial: float = 1_000_000.0) -> Tuple[float, int]:
-    d = df.copy().sort_values("ts_kst")
-    d["date"] = d["ts_kst"].dt.date
-    d["hour"] = d["ts_kst"].dt.hour
-    dates = sorted(d["date"].unique())
-    capital = float(initial)
-    trades = 0
-    for i in range(len(dates) - 1):
-        today, next_day = dates[i], dates[i + 1]
-        buy_row = d[(d["date"] == today) & (d["hour"] == buy_hour)]
-        sell_row = d[(d["date"] == next_day) & (d["hour"] == sell_hour)]
-        if buy_row.empty or sell_row.empty:
-            continue
-        buy_price = float(buy_row.iloc[0]["close"])
-        sell_price = float(sell_row.iloc[0]["close"])
-        if buy_price <= 0:
-            continue
-        qty = capital / buy_price
-        capital = qty * sell_price
-        trades += 1
-    return round(capital, 2), trades
-
-
-def to_excel(df: pd.DataFrame, outpath: Path):
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(outpath, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Raw")
-
-
-def analyze_hod(
-    market: str,
-    days: int,
-    unit: int,
-    night_spec: str,
-    morning_spec: str,
-    save_raw: Optional[str] = None,
-) -> str:
-    df = fetch_candles(FetchConfig(market=market, unit=unit, days=days))
-    if df.empty:
-        return "[ERROR] 데이터 수집 실패"
-    night = parse_window(night_spec)
-    morning = parse_window(morning_spec)
-    buy_hour, sell_hour, buy_mean_low, sell_mean_high = find_best_hours(df, night, morning)
-    final_capital, trades = simulate_daily(df, buy_hour, sell_hour, initial=1_000_000.0)
-    total_ret = (final_capital / 1_000_000.0 - 1.0) * 100.0
-    lines = [
-        f"[INFO] 수집: {market}, 최근 {days}일, {unit}분봉",
-        f"[RESULT] 매수 시간대(야간 {night_spec} 중 평균 저가 최저): {buy_hour}시 (평균 저가 {buy_mean_low:.4f})",
-        f"[RESULT] 매도 시간대(아침 {morning_spec} 중 평균 고가 최고): {sell_hour}시 (평균 고가 {sell_mean_high:.4f})",
-        f"[SIM] 거래 횟수: {trades}",
-        f"[SIM] 초기 1,000,000원 → 최종 {final_capital:,.2f}원 (누적 수익률 {total_ret:.2f}%)",
-    ]
-    if save_raw:
-        to_excel(df, Path(save_raw))
-        lines.append(f"[SAVE] Raw 저장: {save_raw}")
-    return "\n".join(lines)
-
-
-def run_hod_cli(market: str, days: int, unit: int, night_spec: str, morning_spec: str, save_raw: Optional[str] = None):
-    print(analyze_hod(market, days, unit, night_spec, morning_spec, save_raw=save_raw))
-
-
-def prompt_input() -> Tuple[str, int, int, str, str]:
-    m = input("마켓(예: KRW-ETC, KRW-BTC, KRW-ADA): ").strip().upper()
-    if not m.startswith("KRW-"):
-        m = f"KRW-{m}"
-    while True:
-        s = input("최근 N일 (기본 300): ").strip()
-        if not s:
-            d = 300
-            break
-        if s.isdigit() and int(s) > 0:
-            d = int(s)
-            break
-        print("양의 정수를 입력하세요.")
-    u = input("분봉 단위(기본 60): ").strip()
-    unit = int(u) if (u.isdigit() and int(u) > 0) else 60
-    night = input("야간창(기본 22-7): ").strip() or "22-7"
-    morning = input("아침창(기본 7-12): ").strip() or "7-12"
-    return m, d, unit, night, morning
-
-# ----- Conversation state keys -----
-STATE = "state"
-ANALYZE_TICKERS = "ANALYZE_TICKERS"
-ANALYZE_DAYS = "ANALYZE_DAYS"
-ANALYZE_UNIT = "ANALYZE_UNIT"
-API_KEY = "API_KEY"
-API_SECRET = "API_SECRET"
-SETTRADE_PERCENT = "SETTRADE_PERCENT"
-SETTRADE_BUY = "SETTRADE_BUY"
-SETTRADE_SELL = "SETTRADE_SELL"
-
-# ----- Utility functions -----
-def parse_time_str(t: str) -> dt.time:
-    if len(t) not in (3, 4):
-        raise ValueError("HHMM format required")
-    t = t.zfill(4)
-    return dt.time(int(t[:2]), int(t[2:]), tzinfo=KST)
-
-
-def fetch_candles_range(market: str, start: dt.datetime, end: dt.datetime, unit: int) -> pd.DataFrame:
-    url = UPBIT_MIN_URL.format(unit=unit)
-    results: List[Dict[str, object]] = []
-    to = end
-    while to > start:
-        count = min(200, int((to - start).total_seconds() / 60 / unit))
-        if count <= 0:
-            break
-        params = {
-            "market": market,
-            "to": to.strftime("%Y-%m-%d %H:%M:%S"),
-            "count": count,
-        }
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if not data:
-            break
-        for item in data:
-            t = dt.datetime.strptime(item["candle_date_time_kst"], "%Y-%m-%dT%H:%M:%S")
-            t = t.replace(tzinfo=KST)
-            if t < start:
-                continue
-            results.append({"time": t, "price": float(item["trade_price"])})
-        last = data[-1]
-        to = dt.datetime.strptime(last["candle_date_time_kst"], "%Y-%m-%dT%H:%M:%S")
-        to = to.replace(tzinfo=KST) - dt.timedelta(minutes=unit)
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df.sort_values("time", inplace=True)
-    return df
-
-
-def perform_analysis_sync(tickers: List[str], days: int, unit: int) -> Tuple[List[str], List[str]]:
-    """Perform analysis synchronously and return summary lines and file paths."""
-    summaries: List[str] = []
-    files: List[str] = []
-    for t in tickers:
-        market = t if t.startswith("KRW-") else f"KRW-{t}"
+# ========== 계산 로직 ==========
+async def calc_top_volatility(period_days: int) -> pd.DataFrame:
+    async with aiohttp.ClientSession() as session:
+        markets = await fetch_markets(session)
         rows = []
-        for i in range(days):
-            d = dt.datetime.now(KST).date() - dt.timedelta(days=i)
-            start_night = dt.datetime.combine(d - dt.timedelta(days=1), dt.time(21, 0, tzinfo=KST))
-            end_night = dt.datetime.combine(d, dt.time(7, 0, tzinfo=KST))
-            start_morn = dt.datetime.combine(d, dt.time(7, 0, tzinfo=KST))
-            end_morn = dt.datetime.combine(d, dt.time(12, 0, tzinfo=KST))
-            df_night = fetch_candles_range(market, start_night, end_night, unit)
-            df_morn = fetch_candles_range(market, start_morn, end_morn, unit)
-            if df_night.empty or df_morn.empty:
+        for i, m in enumerate(markets):
+            df = await fetch_daily_candles(session, m, period_days)
+            if len(df) < 10:
                 continue
-            min_row = df_night.loc[df_night["price"].idxmin()]
-            max_row = df_morn.loc[df_morn["price"].idxmax()]
-            rows.append({
-                "date": d.isoformat(),
-                "night_time": min_row["time"].strftime("%H:%M"),
-                "night_price": min_row["price"],
-                "morning_time": max_row["time"].strftime("%H:%M"),
-                "morning_price": max_row["price"],
-            })
-        df = pd.DataFrame(rows)
-        if df.empty:
-            summaries.append(f"{t}: no data")
+            vol = (df["close"] - df["open"]).abs() / df["open"]
+            rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
+            if i % 10 == 0:
+                await asyncio.sleep(0.05)
+        out = pd.DataFrame(rows)
+        out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
+        return out
+
+async def calc_top_value(period_days: int) -> pd.DataFrame:
+    async with aiohttp.ClientSession() as session:
+        markets = await fetch_markets(session)
+        rows = []
+        for i, m in enumerate(markets):
+            df = await fetch_daily_candles(session, m, period_days)
+            if len(df) < 10:
+                continue
+            rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
+            if i % 10 == 0:
+                await asyncio.sleep(0.05)
+        out = pd.DataFrame(rows)
+        out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
+        return out
+
+def _minutes_of_day(ts: pd.Timestamp) -> int:
+    kst = ts.tz_convert("Asia/Seoul")
+    return kst.hour * 60 + kst.minute
+
+def _window_to_minutes(window: Tuple[str, str]) -> List[int]:
+    s = parse_hhmm(window[0])
+    e = parse_hhmm(window[1])
+    return time_range_minutes(s, e)
+
+async def backtest_intraday(
+    market: str,
+    period_days: int,
+    buy_window: Tuple[str, str],
+    sell_window: Tuple[str, str],
+    interval_min: int,
+    budget_krw: int = DEFAULT_BUDGET
+) -> Dict:
+    """
+    1) 기간 동안 '분봉 close'를 일자별로 분해
+    2) buy_window 내 각 '분 단위'의 평균가격을 계산해 최저 평균 분(min_buy)을 선택
+    3) sell_window 내 각 '분 단위'의 평균가격을 계산해 최고 평균 분(min_sell)을 선택
+    4) 각 날짜별로 해당 시점 가격을 사용하여 일일 매수/매도 수익률 계산
+       - 고정예산(매일 100만원 별도) 합산
+       - 재투자(복리) 누적
+    """
+    end = kst_now()
+    need_minutes = period_days * int(24*60/interval_min) + 400  # 버퍼
+    async with aiohttp.ClientSession() as session:
+        df = await fetch_minute_candles(session, market, interval_min, end, need_minutes)
+    if df.empty:
+        return {"error": "분봉 데이터를 가져오지 못했습니다."}
+
+    # 분-오프셋(0~1439) 계산
+    df["min_of_day"] = df["time_kst"].apply(lambda x: _minutes_of_day(pd.Timestamp(x)))
+    df["date"] = df["time_kst"].dt.tz_convert("Asia/Seoul").dt.date
+
+    # 기간 제한
+    first_day = (end - dt.timedelta(days=period_days)).date()
+    df = df[df["date"] >= first_day]
+    if df.empty:
+        return {"error": "해당 기간의 분봉 데이터가 없습니다."}
+
+    # 윈도우 후보 분 리스트
+    buy_candidates = _window_to_minutes(buy_window)
+    sell_candidates = _window_to_minutes(sell_window)
+
+    # 각 분(분해능은 interval_min에 의존)으로 샘플 매핑
+    # interval_min에 맞춰 분을 반올림
+    def round_to_interval(m):
+        return (m // interval_min) * interval_min
+
+    df["bucket_min"] = df["min_of_day"].apply(round_to_interval)
+
+    # 평균가격 by bucket
+    buy_avg = (
+        df[df["bucket_min"].isin(buy_candidates)]
+        .groupby("bucket_min")["close"]
+        .mean()
+        .sort_values(ascending=True)
+    )
+    sell_avg = (
+        df[df["bucket_min"].isin(sell_candidates)]
+        .groupby("bucket_min")["close"]
+        .mean()
+        .sort_values(ascending=False)
+    )
+
+    if buy_avg.empty or sell_avg.empty:
+        return {"error": "지정한 시간대에 데이터가 충분하지 않습니다."}
+
+    best_buy_min = int(buy_avg.index[0])
+    best_sell_min = int(sell_avg.index[0])
+
+    # 일자별 해당 시점 가격 추출
+    buy_price_by_day = (
+        df[df["bucket_min"] == best_buy_min]
+        .groupby("date")["close"].last()
+    )
+    sell_price_by_day = (
+        df[df["bucket_min"] == best_sell_min]
+        .groupby("date")["close"].last()
+    )
+
+    # 매도는 '익일'로 가정 → 날짜+1
+    sell_price_by_day.index = [d + dt.timedelta(days=1) for d in sell_price_by_day.index]
+
+    # 교집합 날짜로 수익률 산출
+    days = sorted(set(buy_price_by_day.index).intersection(set(sell_price_by_day.index)))
+    results = []
+    capital = budget_krw  # 재투자 시작자본
+    cum_capitals = []     # 재투자 궤적
+
+    for d in days:
+        bp = float(buy_price_by_day.get(d, np.nan))
+        sp = float(sell_price_by_day.get(d, np.nan))
+        if np.isnan(bp) or np.isnan(sp) or bp <= 0:
             continue
-        filename = f"analysis_{t}_{days}d_{unit}m.xlsx"
-        df.to_excel(filename, index=False)
-        summaries.append(f"{t}: 저장 {filename} (rows={len(df)})")
-        files.append(filename)
-    return summaries, files
+        ratio = sp / bp
+        # 고정 예산: 매일 100만원을 별개로 투자하여 누적 이익 집계
+        daily_gain = budget_krw * (ratio - 1.0)
+        results.append({"date": d, "buy": bp, "sell": sp, "ratio": ratio, "daily_gain": daily_gain})
+        # 재투자(복리)
+        capital *= ratio
+        cum_capitals.append(capital)
 
+    if not results:
+        return {"error": "매수/매도 시점이 겹치는 일자가 충분하지 않습니다."}
 
-async def perform_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, tickers: List[str], days: int, unit: int) -> None:
-    summaries, files = await asyncio.to_thread(perform_analysis_sync, tickers, days, unit)
-    for fpath in files:
-        await update.message.reply_document(InputFile(fpath))
-    if summaries:
-        await update.message.reply_text("\n".join(summaries))
+    res_df = pd.DataFrame(results).sort_values("date")
+    total_fixed = budget_krw * len(res_df) + res_df["daily_gain"].sum()
+    # 재투자: 초기가격 budget_krw → 마지막 capital
+    reinvest_final = budget_krw if not cum_capitals else cum_capitals[-1]
 
+    return {
+        "market": market,
+        "period_days": period_days,
+        "interval_min": interval_min,
+        "best_buy_min": best_buy_min,
+        "best_sell_min": best_sell_min,
+        "n_trades": len(res_df),
+        "fixed_total_krw": int(round(total_fixed)),
+        "reinvest_final_krw": int(round(reinvest_final)),
+        "buy_time_str": f"{best_buy_min//60:02d}:{best_buy_min%60:02d}",
+        "sell_time_str": f"{best_sell_min//60:02d}:{best_sell_min%60:02d}",
+        "sample": res_df.tail(5).to_string(index=False)  # 최근 5일 샘플
+    }
 
-async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
-    market = args[0] if len(args) > 0 else "KRW-ETC"
-    days = int(args[1]) if len(args) > 1 else 300
-    unit = int(args[2]) if len(args) > 2 else 60
-    night = args[3] if len(args) > 3 else "22-7"
-    morning = args[4] if len(args) > 4 else "7-12"
-    try:
-        result = analyze_hod(market, days, unit, night, morning)
-    except Exception as e:
-        result = f"[ERROR] {e}"
-    await update.message.reply_text(result)
-
-
-# ----- Menu and conversation handlers -----
-async def cmd_bts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [InlineKeyboardButton("코인 분석", callback_data="analyze")],
-        [InlineKeyboardButton("API 설정", callback_data="setapi")],
-        [InlineKeyboardButton("매매 설정", callback_data="settrade")],
-        [InlineKeyboardButton("매매 시작", callback_data="start")],
-        [InlineKeyboardButton("매매 중지", callback_data="stop")],
-        [InlineKeyboardButton("도움말", callback_data="help")],
-    ]
+# ========== 텔레그램 핸들러 ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return
     await update.message.reply_text(
-        "메뉴를 선택하세요",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        "안녕하세요! /bts 를 입력하면 코인 분석 메뉴가 열립니다.",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-
-async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "analyze":
-        await query.message.reply_text("티커를 입력하세요 (예: MANA,ADA)")
-        context.user_data[STATE] = ANALYZE_TICKERS
-    elif data == "setapi":
-        await query.message.reply_text("API 키를 입력하세요")
-        context.user_data[STATE] = API_KEY
-    elif data == "settrade":
-        await query.message.reply_text("매매 비중을 입력하세요 (예: 50)")
-        context.user_data[STATE] = SETTRADE_PERCENT
-    elif data == "start":
-        await cmd_starttrade(update, context)
-    elif data == "stop":
-        await cmd_stoptrade(update, context)
-    elif data == "help":
-        await cmd_help(update, context)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = context.user_data.get(STATE)
-    text = update.message.text.strip()
-    if state == ANALYZE_TICKERS:
-        context.user_data["tickers"] = [t.strip().upper() for t in text.split(',') if t.strip()]
-        await update.message.reply_text("조회 기간(일)을 입력하세요")
-        context.user_data[STATE] = ANALYZE_DAYS
-    elif state == ANALYZE_DAYS:
-        context.user_data["days"] = int(text)
-        await update.message.reply_text("분봉 단위를 입력하세요 (1-240)")
-        context.user_data[STATE] = ANALYZE_UNIT
-    elif state == ANALYZE_UNIT:
-        tickers = context.user_data.pop("tickers")
-        days = context.user_data.pop("days")
-        context.user_data.pop(STATE, None)
-        await update.message.reply_text("분석을 시작합니다. 완료되면 결과를 보내 드릴게요.")
-        asyncio.create_task(perform_analysis(update, context, tickers, days, int(text)))
-    elif state == API_KEY:
-        context.user_data["api_key"] = text
-        await update.message.reply_text("API 시크릿을 입력하세요")
-        context.user_data[STATE] = API_SECRET
-    elif state == API_SECRET:
-        trade_cfg.api_key = context.user_data.pop("api_key")
-        trade_cfg.api_secret = text
-        context.user_data.pop(STATE, None)
-        await update.message.reply_text("API 설정 완료")
-    elif state == SETTRADE_PERCENT:
-        trade_cfg.percent = float(text)
-        await update.message.reply_text("매입 시간을 입력하세요 (예: 1900)")
-        context.user_data[STATE] = SETTRADE_BUY
-    elif state == SETTRADE_BUY:
-        trade_cfg.buy_time = text
-        await update.message.reply_text("매각 시간을 입력하세요 (예: 2330)")
-        context.user_data[STATE] = SETTRADE_SELL
-    elif state == SETTRADE_SELL:
-        trade_cfg.sell_time = text
-        context.user_data.pop(STATE, None)
-        await update.message.reply_text("매매 설정 완료")
-
-
-# ----- Trade functions -----
-def execute_buy(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not pybithumb or not trade_cfg.api_key:
-        return
-    # TODO: implement actual buy logic
-    context.bot.send_message(context.job.chat_id, "[모의] 매수 실행")
-
-
-def execute_sell(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not pybithumb or not trade_cfg.api_key:
-        return
-    # TODO: implement actual sell logic
-    context.bot.send_message(context.job.chat_id, "[모의] 매도 실행")
-
-
-async def cmd_starttrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if trade_cfg.job_buy or trade_cfg.job_sell:
-        await update.effective_message.reply_text("이미 실행 중입니다")
-        return
-    try:
-        buy_t = parse_time_str(trade_cfg.buy_time)
-        sell_t = parse_time_str(trade_cfg.sell_time)
-    except Exception as e:
-        await update.effective_message.reply_text(f"시간 설정 오류: {e}")
-        return
-    trade_cfg.job_buy = context.job_queue.run_daily(execute_buy, buy_t, chat_id=update.effective_chat.id)
-    trade_cfg.job_sell = context.job_queue.run_daily(execute_sell, sell_t, chat_id=update.effective_chat.id)
-    await update.effective_message.reply_text("자동 매매 시작")
-
-
-async def cmd_stoptrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    for job in (trade_cfg.job_buy, trade_cfg.job_sell):
-        if job:
-            job.schedule_removal()
-    trade_cfg.job_buy = trade_cfg.job_sell = None
-    await update.effective_message.reply_text("자동 매매 중지")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "1. /start 또는 /bts 명령으로 메뉴를 연 후 원하는 기능을 선택하세요.\n"
-        "2. 각 기능은 안내에 따라 정보를 입력하면 됩니다.\n"
-        "3. /hod [티커] [일수] [분봉] [야간] [아침] 명령으로 HOD 분석을 실행합니다."
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors raised during update handling."""
-    logging.error("Exception while handling an update:", exc_info=context.error)
-
-
-# ----- Main -----
-def start_bot() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler(["bts", "start"], cmd_bts))
-    app.add_handler(CallbackQueryHandler(menu_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("hod", cmd_hod))
-    app.add_error_handler(error_handler)
-    logging.info("Bot started. Waiting for commands...")
-    try:
-        app.run_polling()
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Bot stopping...", exc_info=True)
-    finally:
-        app.stop()
-        try:
-            asyncio.run(app.shutdown())
-            asyncio.run(app.wait_closed())
-        except Exception:
-            logging.exception("Error during shutdown")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Telegram bot and HOD analysis")
-    ap.add_argument("--bot", action="store_true", help="Run Telegram bot")
-    ap.add_argument("--market", type=str, help="마켓 티커 (예: KRW-ETC)")
-    ap.add_argument("--days", type=int, help="최근 N일 (기본 300)")
-    ap.add_argument("--unit", type=int, default=60, help="분봉 단위(기본 60)")
-    ap.add_argument("--night", type=str, default="22-7", help="야간창 (기본 22-7)")
-    ap.add_argument("--morning", type=str, default="7-12", help="아침창 (기본 7-12)")
-    ap.add_argument("--save-raw", type=str, default=None, help="Raw 저장 경로(excel). 지정 시 저장")
-    ap.add_argument("--interactive", action="store_true", help="프롬프트로 입력 받기")
-    args = ap.parse_args()
-    if args.bot or not (args.market and args.days) and not args.interactive:
-        start_bot()
-        return
-    if args.interactive or not (args.market and args.days):
-        market, days, unit, night, morning = prompt_input()
+async def bts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return ConversationHandler.END
+    kb = [
+        [InlineKeyboardButton("1) 변동성 Top10", callback_data="MENU_VOL")],
+        [InlineKeyboardButton("2) 거래액 Top10", callback_data="MENU_VAL")],
+        [InlineKeyboardButton("3) 일일단가 수익률 비교 (백테스트)", callback_data="MENU_BT")],
+        [InlineKeyboardButton("닫기", callback_data="MENU_END")],
+    ]
+    if update.message:
+        await update.message.reply_text("원하는 작업을 선택하세요:", reply_markup=InlineKeyboardMarkup(kb))
     else:
-        market = args.market.upper()
-        if not market.startswith("KRW-"):
-            market = "KRW-" + market
-        days = args.days if args.days else 300
-        unit = args.unit
-        night = args.night
-        morning = args.morning
-    run_hod_cli(market, days, unit, night, morning, save_raw=args.save_raw)
+        await update.callback_query.edit_message_text("원하는 작업을 선택하세요:", reply_markup=InlineKeyboardMarkup(kb))
+    return MENU
 
+# ---- 메뉴 분기
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return ConversationHandler.END
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "MENU_VOL":
+        await q.edit_message_text("변동성 조회기간을 입력하시오 (예: 200 또는 300)")
+        return Q1_PERIOD
+    elif data == "MENU_VAL":
+        await q.edit_message_text("거래액 조회기간을 입력하시오 (예: 200 또는 300)")
+        return Q2_PERIOD
+    elif data == "MENU_BT":
+        await q.edit_message_text("종목을 입력하시오 (예: KRW-BTC, KRW-ETH)")
+        return Q3_SYMBOL
+    else:
+        await q.edit_message_text("종료합니다.")
+        return ConversationHandler.END
+
+# ---- 기능 1: 변동성
+async def on_q1_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        period = int(update.message.text.strip())
+        await update.message.reply_text("계산 중입니다. 잠시만요…")
+        df = await calc_top_volatility(period)
+        if df.empty:
+            await update.message.reply_text("결과가 없습니다.")
+        else:
+            lines = ["[변동성 Top10] (기간: {}일)".format(period)]
+            for i, row in df.iterrows():
+                lines.append(f"{i+1:>2}. {row['market']}: {row['mean_oc_volatility_pct']:.2f}%")
+            await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+    # 끝나면 다시 메뉴
+    return await bts_menu(update, context)
+
+# ---- 기능 2: 거래액
+async def on_q2_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        period = int(update.message.text.strip())
+        await update.message.reply_text("계산 중입니다. 잠시만요…")
+        df = await calc_top_value(period)
+        if df.empty:
+            await update.message.reply_text("결과가 없습니다.")
+        else:
+            lines = ["[거래액(원화) Top10] (기간: {}일)".format(period)]
+            for i, row in df.iterrows():
+                lines.append(f"{i+1:>2}. {row['market']}: {int(row['mean_daily_value_krw']):,} 원/일")
+            await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+    return await bts_menu(update, context)
+
+# ---- 기능 3: 백테스트
+async def on_q3_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return ConversationHandler.END
+    sym = update.message.text.strip().upper()
+    if not sym.startswith("KRW-"):
+        await update.message.reply_text("형식: KRW-XXX (예: KRW-BTC)")
+        return Q3_SYMBOL
+    context.user_data["bt_symbol"] = sym
+    await update.message.reply_text("조회기간(일)을 입력하시오 (예: 200, 300)")
+    return Q3_PERIOD
+
+async def on_q3_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        period = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("숫자로 입력해주세요. (예: 200)")
+        return Q3_PERIOD
+    context.user_data["bt_period"] = period
+    bw = f"{DEFAULT_BUY_WINDOW[0]}~{DEFAULT_BUY_WINDOW[1]}"
+    await update.message.reply_text(
+        f"매입 시간대를 입력하시오 (기본: {bw})\n예) 19:00~01:00",
+    )
+    return Q3_BUY_WINDOW
+
+async def on_q3_buy_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if "~" not in txt:
+        await update.message.reply_text("형식: HH:MM~HH:MM (예: 19:00~01:00)")
+        return Q3_BUY_WINDOW
+    s, e = [t.strip() for t in txt.split("~", 1)]
+    context.user_data["bt_buy_window"] = (s, e)
+    sw = f"{DEFAULT_SELL_WINDOW[0]}~{DEFAULT_SELL_WINDOW[1]}"
+    await update.message.reply_text(
+        f"매각 시간대를 입력하시오 (기본: {sw})\n예) 08:00~12:00",
+    )
+    return Q3_SELL_WINDOW
+
+async def on_q3_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if "~" not in txt:
+        await update.message.reply_text("형식: HH:MM~HH:MM (예: 08:00~12:00)")
+        return Q3_SELL_WINDOW
+    s, e = [t.strip() for t in txt.split("~", 1)]
+    context.user_data["bt_sell_window"] = (s, e)
+    await update.message.reply_text(
+        f"분봉(1/3/5/10/15/30/60/240)을 입력하시오 (기본: {DEFAULT_INTERVAL_MIN})"
+    )
+    return Q3_INTERVAL
+
+async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        interval = int(update.message.text.strip())
+        if interval not in [1,3,5,10,15,30,60,240]:
+            raise ValueError
+    except:
+        await update.message.reply_text("분봉은 1/3/5/10/15/30/60/240 중 하나여야 합니다.")
+        return Q3_INTERVAL
+
+    sym = context.user_data["bt_symbol"]
+    period = context.user_data["bt_period"]
+    buyw = context.user_data.get("bt_buy_window", DEFAULT_BUY_WINDOW)
+    sellw = context.user_data.get("bt_sell_window", DEFAULT_SELL_WINDOW)
+
+    await update.message.reply_text("백테스트 계산 중입니다. 다소 시간이 걸릴 수 있어요…")
+    try:
+        res = await backtest_intraday(sym, period, buyw, sellw, interval, DEFAULT_BUDGET)
+        if "error" in res:
+            await update.message.reply_text(f"오류: {res['error']}")
+        else:
+            msg = (
+                f"[백테스트 결과]\n"
+                f"종목: {res['market']}\n"
+                f"기간: {res['period_days']}일, 분봉: {res['interval_min']}분\n"
+                f"선택된 매입 시각(평균 최저): {res['buy_time_str']}\n"
+                f"선택된 매도 시각(평균 최고): {res['sell_time_str']}\n"
+                f"체결 가능 일수: {res['n_trades']}일\n"
+                f"① 고정예산 합산 결과: {res['fixed_total_krw']:,} 원\n"
+                f"② 매일 재투자(복리) 결과: {res['reinvest_final_krw']:,} 원\n"
+                f"\n최근 5일 샘플:\n{res['sample']}"
+            )
+            await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+    return await bts_menu(update, context)
+
+# ========== 앱 구동 ==========
+import logging
+logging.basicConfig(level=logging.INFO)
+
+def build_app():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("bts", bts_menu)],
+        states={
+            MENU: [CallbackQueryHandler(on_menu)],
+            Q1_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q1_period)],
+            Q2_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q2_period)],
+            Q3_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_symbol)],
+            Q3_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_period)],
+            Q3_BUY_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_buy_window)],
+            Q3_SELL_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_sell_window)],
+            Q3_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_interval)],
+        },
+        fallbacks=[CommandHandler("bts", bts_menu)],
+        name="bts-conv",
+        persistent=False,
+        # ⛔️ per_message=True 는 사용하지 않습니다 (MessageHandler가 섞여있음)
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv)
+    return app
+
+
+def main():
+    app = build_app()
+    # PTB v21 권장: 한 줄로 시작/대기까지 처리
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
