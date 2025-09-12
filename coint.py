@@ -187,11 +187,9 @@ async def calc_top_volatility(period_days: int) -> pd.DataFrame:
         rows = []
         for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
-            if len(df) < min_days:
-                await asyncio.sleep(0.15)
-                continue
-            vol = (df["close"] - df["open"]).abs() / df["open"]
-            rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
+            if len(df) >= min_days:
+                vol = (df["close"] - df["open"]).abs() / df["open"]
+                rows.append({"market": m, "mean_oc_volatility_pct": vol.mean() * 100.0})
             # 모든 호출 사이에 0.15초 지연을 두어 초당 10회 제한 준수
             await asyncio.sleep(0.15)
         out = pd.DataFrame(rows)
@@ -205,10 +203,8 @@ async def calc_top_value(period_days: int) -> pd.DataFrame:
         rows = []
         for m in markets:
             df = await fetch_daily_candles(session, m, period_days)
-            if len(df) < min_days:
-                await asyncio.sleep(0.15)
-                continue
-            rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
+            if len(df) >= min_days:
+                rows.append({"market": m, "mean_daily_value_krw": df["value_krw"].mean()})
             # 모든 호출 사이에 0.15초 지연을 두어 초당 10회 제한 준수
             await asyncio.sleep(0.15)
         out = pd.DataFrame(rows)
