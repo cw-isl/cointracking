@@ -193,9 +193,10 @@ async def calc_top_volatility(period_days: int) -> pd.DataFrame:
         async for m, df in iter_markets_daily(session, period_days):
             oc_vol = (df["close"] - df["open"]).abs() / df["open"] * 100.0
             rows.append({"market": m, "mean_oc_volatility_pct": float(oc_vol.mean())})
-        if not rows:
-            return pd.DataFrame(columns=["market", "mean_oc_volatility_pct"])
-        out = pd.DataFrame(rows)
+        # 항상 예상된 칼럼을 갖도록 DataFrame을 생성한다.
+        out = pd.DataFrame(rows, columns=["market", "mean_oc_volatility_pct"])
+        if out.empty:
+            return out
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
 
@@ -204,9 +205,9 @@ async def calc_top_value(period_days: int) -> pd.DataFrame:
         rows: List[Dict[str, float]] = []
         async for m, df in iter_markets_daily(session, period_days):
             rows.append({"market": m, "mean_daily_value_krw": float(df["value_krw"].mean())})
-        if not rows:
-            return pd.DataFrame(columns=["market", "mean_daily_value_krw"])
-        out = pd.DataFrame(rows)
+        out = pd.DataFrame(rows, columns=["market", "mean_daily_value_krw"])
+        if out.empty:
+            return out
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
 
@@ -397,7 +398,12 @@ async def on_q1_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines = ["[변동성 Top10] (기간: {}일)".format(period)]
             for i, row in df.iterrows():
-                lines.append(f"{i+1:>2}. {row['market']}: {row['mean_oc_volatility_pct']:.2f}%")
+                market = row.get("market", "N/A")
+                vol = row.get("mean_oc_volatility_pct")
+                if pd.isna(vol):
+                    lines.append(f"{i+1:>2}. {market}: N/A")
+                else:
+                    lines.append(f"{i+1:>2}. {market}: {vol:.2f}%")
             await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"오류: {e}")
@@ -420,7 +426,12 @@ async def on_q2_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines = ["[거래액(원화) Top10] (기간: {}일)".format(period)]
             for i, row in df.iterrows():
-                lines.append(f"{i+1:>2}. {row['market']}: {int(row['mean_daily_value_krw']):,} 원/일")
+                market = row.get("market", "N/A")
+                val = row.get("mean_daily_value_krw")
+                if pd.isna(val):
+                    lines.append(f"{i+1:>2}. {market}: N/A")
+                else:
+                    lines.append(f"{i+1:>2}. {market}: {int(val):,} 원/일")
             await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"오류: {e}")
