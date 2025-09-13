@@ -23,6 +23,7 @@
 import asyncio
 import datetime as dt
 import math
+import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -340,8 +341,7 @@ async def backtest_intraday(
         "bank_final_krw": int(round(bank_final)),
         "bank_profit_pct": bank_profit_pct,
         "buy_time_str": f"{best_buy_min//60:02d}:{best_buy_min%60:02d}",
-        "sell_time_str": f"{best_sell_min//60:02d}:{best_sell_min%60:02d}",
-        "sample": res_df.tail(5).to_string(index=False)  # 최근 5일 샘플
+        "sell_time_str": f"{best_sell_min//60:02d}:{best_sell_min%60:02d}"
     }
 
 # ========== 텔레그램 핸들러 ==========
@@ -447,11 +447,17 @@ async def on_q2_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_q3_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_allowed(update.effective_user.id):
         return ConversationHandler.END
-    sym = update.message.text.strip().upper()
-    if not sym.startswith("KRW-"):
-        await update.message.reply_text("형식: KRW-XXX (예: KRW-BTC)")
+    text = update.message.text.strip().upper()
+    parts = [p.strip() for p in re.split(r'[\s,]+', text) if p.strip()]
+    if not parts:
+        await update.message.reply_text("티커를 입력해주세요 (예: BTC 또는 BTC,ETH)")
         return Q3_SYMBOL
-    context.user_data["bt_symbol"] = sym
+    symbols = []
+    for p in parts[:10]:
+        if p.startswith("KRW-"):
+            p = p[4:]
+        symbols.append(p)
+    context.user_data["bt_symbols"] = [f"KRW-{s}" for s in symbols]
     await update.message.reply_text("조회기간(일)을 입력하시오 (예: 200, 300)")
     return Q3_PERIOD
 
@@ -476,30 +482,30 @@ async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("분봉은 1/3/5/10/15/30/60/240 중 하나여야 합니다.")
         return Q3_INTERVAL
 
-    sym = context.user_data["bt_symbol"]
+    symbols = context.user_data["bt_symbols"]
     period = context.user_data["bt_period"]
 
     await update.message.reply_text("백테스트 계산 중입니다. 다소 시간이 걸릴 수 있어요…")
     try:
-        res = await backtest_intraday(sym, period, interval_min=interval, budget_krw=DEFAULT_BUDGET)
-        if "error" in res:
-            await update.message.reply_text(f"오류: {res['error']}")
-        else:
+        lines = ["[백테스트 결과]"]
+        for sym in symbols:
+            res = await backtest_intraday(sym, period, interval_min=interval, budget_krw=DEFAULT_BUDGET)
+            if "error" in res:
+                lines.append(f"{sym}: 오류 - {res['error']}")
+                continue
             msg = (
-                f"[백테스트 결과]\n"
                 f"종목: {res['market']}\n"
                 f"기간: {res['period_days']}일, 분봉: {res['interval_min']}분\n"
-                f"선택된 매입 시각(평균 최저): {res['buy_time_str']}\n"
-                f"선택된 매도 시각(평균 최고): {res['sell_time_str']}\n"
+                f"매입 시각: {res['buy_time_str']} / 매도 시각: {res['sell_time_str']}\n"
                 f"체결 가능 일수: {res['n_trades']}일\n"
-                f"매일 재투자(복리) 결과: {res['reinvest_final_krw']:,} 원\n"
-                f"초기 자본 대비 수익률: {res['reinvest_profit_pct']:.2f}%\n"
-                f"동일 기간 은행 예금(연 {DEFAULT_BANK_RATE*100:.1f}%) 결과: {res['bank_final_krw']:,} 원\n"
+                f"재투자 결과: {res['reinvest_final_krw']:,} 원\n"
+                f"수익률: {res['reinvest_profit_pct']:.2f}%\n"
                 f"은행 수익률: {res['bank_profit_pct']:.2f}%\n"
-                f"승률: {res['win_rate_pct']:.2f}%\n"
-                f"\n최근 5일 샘플:\n{res['sample']}"
+                f"승률: {res['win_rate_pct']:.2f}%"
             )
-            await update.message.reply_text(msg)
+            lines.append(msg)
+            lines.append("")
+        await update.message.reply_text("\n".join(lines).strip())
     except Exception as e:
         await update.message.reply_text(f"오류: {e}")
 
