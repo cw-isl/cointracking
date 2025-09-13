@@ -57,6 +57,7 @@ DEFAULT_BUY_WINDOW = ("19:00", "01:00")  # (시작, 끝) 끝이 익일 가능
 DEFAULT_SELL_WINDOW = ("08:00", "12:00")  # (시작, 끝) 동일/익일 가능
 DEFAULT_INTERVAL_MIN = 5
 DEFAULT_BUDGET = 1_000_000  # 원
+DEFAULT_FEE_RATE = 0.0005  # 매수/매도 각각 0.05%
 MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
 
 # ========== 내부 상태키 ==========
@@ -226,15 +227,16 @@ async def backtest_intraday(
     buy_window: Tuple[str, str],
     sell_window: Tuple[str, str],
     interval_min: int,
-    budget_krw: int = DEFAULT_BUDGET
+    budget_krw: int = DEFAULT_BUDGET,
+    fee_rate: float = DEFAULT_FEE_RATE,
 ) -> Dict:
     """
     1) 기간 동안 '분봉 close'를 일자별로 분해
     2) buy_window 내 각 '분 단위'의 평균가격을 계산해 최저 평균 분(min_buy)을 선택
     3) sell_window 내 각 '분 단위'의 평균가격을 계산해 최고 평균 분(min_sell)을 선택
     4) 각 날짜별로 해당 시점 가격을 사용하여 일일 매수/매도 수익률 계산
-       - 고정예산(매일 100만원 별도) 합산
        - 재투자(복리) 누적
+       - 거래소 수수료(fee_rate) 반영
     """
     end = kst_now()
     need_minutes = period_days * int(24*60/interval_min) + 400  # 버퍼
@@ -302,17 +304,16 @@ async def backtest_intraday(
     results = []
     capital = budget_krw  # 재투자 시작자본
     cum_capitals = []     # 재투자 궤적
+    ratios = []
 
     for d in days:
         bp = float(buy_price_by_day.get(d, np.nan))
         sp = float(sell_price_by_day.get(d, np.nan))
         if np.isnan(bp) or np.isnan(sp) or bp <= 0:
             continue
-        ratio = sp / bp
-        # 고정 예산: 매일 100만원을 별개로 투자하여 누적 이익 집계
-        daily_gain = budget_krw * (ratio - 1.0)
-        results.append({"date": d, "buy": bp, "sell": sp, "ratio": ratio, "daily_gain": daily_gain})
-        # 재투자(복리)
+        ratio = (sp / bp) * (1 - fee_rate) * (1 - fee_rate)
+        results.append({"date": d, "buy": bp, "sell": sp, "ratio": ratio})
+        ratios.append(ratio)
         capital *= ratio
         cum_capitals.append(capital)
 
@@ -320,9 +321,11 @@ async def backtest_intraday(
         return {"error": "매수/매도 시점이 겹치는 일자가 충분하지 않습니다."}
 
     res_df = pd.DataFrame(results).sort_values("date")
-    total_fixed = budget_krw * len(res_df) + res_df["daily_gain"].sum()
-    # 재투자: 초기가격 budget_krw → 마지막 capital
     reinvest_final = budget_krw if not cum_capitals else cum_capitals[-1]
+    profit_pct = (reinvest_final / budget_krw - 1.0) * 100.0
+    win_rate = 0.0
+    if ratios:
+        win_rate = sum(1 for r in ratios if r > 1.0) / len(ratios) * 100.0
 
     return {
         "market": market,
@@ -331,8 +334,9 @@ async def backtest_intraday(
         "best_buy_min": best_buy_min,
         "best_sell_min": best_sell_min,
         "n_trades": len(res_df),
-        "fixed_total_krw": int(round(total_fixed)),
         "reinvest_final_krw": int(round(reinvest_final)),
+        "reinvest_profit_pct": profit_pct,
+        "win_rate_pct": win_rate,
         "buy_time_str": f"{best_buy_min//60:02d}:{best_buy_min%60:02d}",
         "sell_time_str": f"{best_sell_min//60:02d}:{best_sell_min%60:02d}",
         "sample": res_df.tail(5).to_string(index=False)  # 최근 5일 샘플
@@ -514,8 +518,9 @@ async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"선택된 매입 시각(평균 최저): {res['buy_time_str']}\n"
                 f"선택된 매도 시각(평균 최고): {res['sell_time_str']}\n"
                 f"체결 가능 일수: {res['n_trades']}일\n"
-                f"① 고정예산 합산 결과: {res['fixed_total_krw']:,} 원\n"
-                f"② 매일 재투자(복리) 결과: {res['reinvest_final_krw']:,} 원\n"
+                f"매일 재투자(복리) 결과: {res['reinvest_final_krw']:,} 원\n"
+                f"초기 자본 대비 수익률: {res['reinvest_profit_pct']:.2f}%\n"
+                f"승률: {res['win_rate_pct']:.2f}%\n"
                 f"\n최근 5일 샘플:\n{res['sample']}"
             )
             await update.message.reply_text(msg)
