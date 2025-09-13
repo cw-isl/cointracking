@@ -179,6 +179,9 @@ async def fetch_minute_candles(
 async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
     """Yield (market, daily_df) for KRW markets with enough history."""
     markets = await fetch_markets(session)
+    min_days = period_days
+    for m in markets:
+        df = await fetch_daily_candles(session, m, period_days)
         if len(df) >= min_days:
             yield m, df
         await asyncio.sleep(API_REQUEST_DELAY)
@@ -186,15 +189,24 @@ async def iter_markets_daily(session: aiohttp.ClientSession, period_days: int):
 # ========== 계산 로직 ==========
 async def calc_top_volatility(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
-        rows = []
-
+        rows: List[Dict[str, float]] = []
+        async for m, df in iter_markets_daily(session, period_days):
+            oc_vol = (df["close"] - df["open"]).abs() / df["open"] * 100.0
+            rows.append({"market": m, "mean_oc_volatility_pct": float(oc_vol.mean())})
+        if not rows:
+            return pd.DataFrame(columns=["market", "mean_oc_volatility_pct"])
+        out = pd.DataFrame(rows)
         out = out.sort_values("mean_oc_volatility_pct", ascending=False).head(10).reset_index(drop=True)
         return out
 
 async def calc_top_value(period_days: int) -> pd.DataFrame:
     async with aiohttp.ClientSession() as session:
-        rows = []
-
+        rows: List[Dict[str, float]] = []
+        async for m, df in iter_markets_daily(session, period_days):
+            rows.append({"market": m, "mean_daily_value_krw": float(df["value_krw"].mean())})
+        if not rows:
+            return pd.DataFrame(columns=["market", "mean_daily_value_krw"])
+        out = pd.DataFrame(rows)
         out = out.sort_values("mean_daily_value_krw", ascending=False).head(10).reset_index(drop=True)
         return out
 
