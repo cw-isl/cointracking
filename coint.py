@@ -8,11 +8,9 @@
   3) 일일단가 수익률 비교 백테스트:
      - 종목 (예: KRW-BTC)
      - 조회기간(일)
-     - 매입 시간대 (기본: 19:00~익일 01:00)
-     - 매각 시간대 (기본: 익일 08:00~익일 12:00)
      - 분봉(1/3/5/10/15/30/60/240)
-     - 기간 동안 평균적으로 '가장 싼 시간(매입)'과 '가장 비싼 시간(매도)'을 각 시간대에서 찾고,
-       매일 100만원을 동일 시간에 사고/팔았다면 결과(고정 예산 합산 vs 매일 재투자 복리)를 계산
+     - 기간 동안 하루 중 평균적으로 가장 낮은 시각과 가장 높은 시각을 자동 탐색하여,
+       매일 같은 시각에 전액 매수/매도했다면 결과(Upbit 수수료 및 시중은행 금리 비교)를 계산
 명령:
   /bts  : 메뉴 시작 (선택형)
   /start: 안내
@@ -53,11 +51,10 @@ UPBIT_BASE = "https://api.upbit.com"
 API_REQUEST_DELAY = 0.15  # seconds between Upbit API calls
 
 # 기본 백테스트 설정
-DEFAULT_BUY_WINDOW = ("19:00", "01:00")  # (시작, 끝) 끝이 익일 가능
-DEFAULT_SELL_WINDOW = ("08:00", "12:00")  # (시작, 끝) 동일/익일 가능
 DEFAULT_INTERVAL_MIN = 5
 DEFAULT_BUDGET = 1_000_000  # 원
 DEFAULT_FEE_RATE = 0.0005  # 매수/매도 각각 0.05%
+DEFAULT_BANK_RATE = 0.03   # 연 3% 시중은행 금리 가정
 MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
 
 # ========== 내부 상태키 ==========
@@ -67,10 +64,8 @@ MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
     Q2_PERIOD,           # 기능2: 거래액 기간
     Q3_SYMBOL,           # 기능3: 종목
     Q3_PERIOD,           # 기능3: 기간
-    Q3_BUY_WINDOW,       # 기능3: 매입 시간대
-    Q3_SELL_WINDOW,      # 기능3: 매도 시간대
     Q3_INTERVAL          # 기능3: 분봉
-) = range(8)
+) = range(6)
 
 # ========== 유틸 ==========
 def user_allowed(user_id: int) -> bool:
@@ -224,11 +219,12 @@ def _window_to_minutes(window: Tuple[str, str]) -> List[int]:
 async def backtest_intraday(
     market: str,
     period_days: int,
-    buy_window: Tuple[str, str],
-    sell_window: Tuple[str, str],
-    interval_min: int,
+    buy_window: Optional[Tuple[str, str]] = None,
+    sell_window: Optional[Tuple[str, str]] = None,
+    interval_min: int = DEFAULT_INTERVAL_MIN,
     budget_krw: int = DEFAULT_BUDGET,
     fee_rate: float = DEFAULT_FEE_RATE,
+    bank_rate: float = DEFAULT_BANK_RATE,
 ) -> Dict:
     """
     1) 기간 동안 '분봉 close'를 일자별로 분해
@@ -255,9 +251,9 @@ async def backtest_intraday(
     if df.empty:
         return {"error": "해당 기간의 분봉 데이터가 없습니다."}
 
-    # 윈도우 후보 분 리스트
-    buy_candidates = _window_to_minutes(buy_window)
-    sell_candidates = _window_to_minutes(sell_window)
+    # 윈도우 후보 분 리스트 (None이면 하루 전체)
+    buy_candidates = list(range(0, 24 * 60)) if buy_window is None else _window_to_minutes(buy_window)
+    sell_candidates = list(range(0, 24 * 60)) if sell_window is None else _window_to_minutes(sell_window)
 
     # 각 분(분해능은 interval_min에 의존)으로 샘플 매핑
     # interval_min에 맞춰 분을 반올림
@@ -321,11 +317,15 @@ async def backtest_intraday(
         return {"error": "매수/매도 시점이 겹치는 일자가 충분하지 않습니다."}
 
     res_df = pd.DataFrame(results).sort_values("date")
+    n_trades = len(res_df)
     reinvest_final = budget_krw if not cum_capitals else cum_capitals[-1]
     profit_pct = (reinvest_final / budget_krw - 1.0) * 100.0
     win_rate = 0.0
     if ratios:
         win_rate = sum(1 for r in ratios if r > 1.0) / len(ratios) * 100.0
+
+    bank_final = budget_krw * ((1 + bank_rate / 365) ** n_trades)
+    bank_profit_pct = (bank_final / budget_krw - 1.0) * 100.0
 
     return {
         "market": market,
@@ -333,10 +333,12 @@ async def backtest_intraday(
         "interval_min": interval_min,
         "best_buy_min": best_buy_min,
         "best_sell_min": best_sell_min,
-        "n_trades": len(res_df),
+        "n_trades": n_trades,
         "reinvest_final_krw": int(round(reinvest_final)),
         "reinvest_profit_pct": profit_pct,
         "win_rate_pct": win_rate,
+        "bank_final_krw": int(round(bank_final)),
+        "bank_profit_pct": bank_profit_pct,
         "buy_time_str": f"{best_buy_min//60:02d}:{best_buy_min%60:02d}",
         "sell_time_str": f"{best_sell_min//60:02d}:{best_sell_min%60:02d}",
         "sample": res_df.tail(5).to_string(index=False)  # 최근 5일 샘플
@@ -460,34 +462,8 @@ async def on_q3_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("숫자로 입력해주세요. (예: 200)")
         return Q3_PERIOD
     context.user_data["bt_period"] = period
-    bw = f"{DEFAULT_BUY_WINDOW[0]}~{DEFAULT_BUY_WINDOW[1]}"
     await update.message.reply_text(
-        f"매입 시간대를 입력하시오 (기본: {bw})\n예) 19:00~01:00",
-    )
-    return Q3_BUY_WINDOW
-
-async def on_q3_buy_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if "~" not in txt:
-        await update.message.reply_text("형식: HH:MM~HH:MM (예: 19:00~01:00)")
-        return Q3_BUY_WINDOW
-    s, e = [t.strip() for t in txt.split("~", 1)]
-    context.user_data["bt_buy_window"] = (s, e)
-    sw = f"{DEFAULT_SELL_WINDOW[0]}~{DEFAULT_SELL_WINDOW[1]}"
-    await update.message.reply_text(
-        f"매각 시간대를 입력하시오 (기본: {sw})\n예) 08:00~12:00",
-    )
-    return Q3_SELL_WINDOW
-
-async def on_q3_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if "~" not in txt:
-        await update.message.reply_text("형식: HH:MM~HH:MM (예: 08:00~12:00)")
-        return Q3_SELL_WINDOW
-    s, e = [t.strip() for t in txt.split("~", 1)]
-    context.user_data["bt_sell_window"] = (s, e)
-    await update.message.reply_text(
-        f"분봉(1/3/5/10/15/30/60/240)을 입력하시오 (기본: {DEFAULT_INTERVAL_MIN})"
+        f"분봉(1/3/5/10/15/30/60/240)을 입력하시오 (기본: {DEFAULT_INTERVAL_MIN})",
     )
     return Q3_INTERVAL
 
@@ -502,12 +478,10 @@ async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sym = context.user_data["bt_symbol"]
     period = context.user_data["bt_period"]
-    buyw = context.user_data.get("bt_buy_window", DEFAULT_BUY_WINDOW)
-    sellw = context.user_data.get("bt_sell_window", DEFAULT_SELL_WINDOW)
 
     await update.message.reply_text("백테스트 계산 중입니다. 다소 시간이 걸릴 수 있어요…")
     try:
-        res = await backtest_intraday(sym, period, buyw, sellw, interval, DEFAULT_BUDGET)
+        res = await backtest_intraday(sym, period, interval_min=interval, budget_krw=DEFAULT_BUDGET)
         if "error" in res:
             await update.message.reply_text(f"오류: {res['error']}")
         else:
@@ -520,6 +494,8 @@ async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"체결 가능 일수: {res['n_trades']}일\n"
                 f"매일 재투자(복리) 결과: {res['reinvest_final_krw']:,} 원\n"
                 f"초기 자본 대비 수익률: {res['reinvest_profit_pct']:.2f}%\n"
+                f"동일 기간 은행 예금(연 {DEFAULT_BANK_RATE*100:.1f}%) 결과: {res['bank_final_krw']:,} 원\n"
+                f"은행 수익률: {res['bank_profit_pct']:.2f}%\n"
                 f"승률: {res['win_rate_pct']:.2f}%\n"
                 f"\n최근 5일 샘플:\n{res['sample']}"
             )
@@ -544,8 +520,6 @@ def build_app():
             Q2_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q2_period)],
             Q3_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_symbol)],
             Q3_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_period)],
-            Q3_BUY_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_buy_window)],
-            Q3_SELL_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_sell_window)],
             Q3_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_interval)],
         },
         fallbacks=[CommandHandler("bts", bts_menu)],
