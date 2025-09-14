@@ -17,12 +17,13 @@
 
 주의:
   - Upbit 공개 API 사용(무인증), 과도한 호출 방지.
-  - 시간대는 Asia/Seoul 기준.
+  - 기본 시간대는 Asia/Seoul이며 환경 변수 `COINTRACKING_TZ`로 변경 가능.
 """
 
 import asyncio
 import datetime as dt
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
@@ -42,7 +43,13 @@ from telegram.ext import (
 
 # ========= 통합 설정 (여기만 수정하면 됨) =========
 TOKEN = "8216690986:AAHCxs_o5nXyOcbd6Sr9ooJhLgs5tcQ7024"  # 요청하신 대로 하드코딩
-TZ = pytz.timezone("Asia/Seoul")
+
+DEFAULT_TZ = "Asia/Seoul"
+_tz_name = os.getenv("COINTRACKING_TZ", DEFAULT_TZ)
+try:
+    TZ = pytz.timezone(_tz_name)
+except Exception:
+    TZ = pytz.timezone(DEFAULT_TZ)
 
 # 텔레그램 접근 제어: 특정 사용자만 사용하려면 ID를 적으세요. 비우면 전체 허용.
 ALLOWED_USER_IDS: List[int] = []  # 예: [5517670242]
@@ -94,7 +101,7 @@ def localize(ts: dt.datetime) -> dt.datetime:
         return TZ.localize(ts)
     return ts.astimezone(TZ)
 
-def kst_now() -> dt.datetime:
+def tz_now() -> dt.datetime:
     return dt.datetime.now(tz=TZ)
 
 # ========== Upbit API ==========
@@ -235,7 +242,7 @@ async def backtest_intraday(
        - 재투자(복리) 누적
        - 거래소 수수료(fee_rate) 반영
     """
-    end = kst_now()
+    end = tz_now()
     need_minutes = period_days * int(24*60/interval_min) + 400  # 버퍼
     async with aiohttp.ClientSession() as session:
         df = await fetch_minute_candles(session, market, interval_min, end, need_minutes)
