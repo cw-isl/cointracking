@@ -74,10 +74,12 @@ MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
     Q3_SYMBOL,           # 기능3: 종목
     Q3_PERIOD,           # 기능3: 기간
     Q3_INTERVAL,         # 기능3: 분봉
+    Q3_BUY_WINDOW,       # 기능3: 매입 시간대
+    Q3_SELL_WINDOW,      # 기능3: 매각 시간대
     Q4_SYMBOL,           # 기능4: 시간대별 분석 종목
     Q4_PERIOD,           # 기능4: 기간
     Q4_INTERVAL          # 기능4: 분봉
-) = range(9)
+) = range(11)
 
 # ========== 유틸 ==========
 def user_allowed(user_id: int) -> bool:
@@ -85,6 +87,18 @@ def user_allowed(user_id: int) -> bool:
 
 def parse_hhmm(s: str) -> dt.time:
     return dt.datetime.strptime(s.strip(), "%H:%M").time()
+
+def parse_window_str(s: str) -> Optional[Tuple[str, str]]:
+    m = re.match(r"^\s*(\d{1,2}:\d{2})\s*~\s*(\d{1,2}:\d{2})\s*$", s)
+    if not m:
+        return None
+    # 유효성 검증을 위해 parse_hhmm 호출
+    try:
+        parse_hhmm(m.group(1))
+        parse_hhmm(m.group(2))
+    except Exception:
+        return None
+    return m.group(1), m.group(2)
 
 def time_range_minutes(start: dt.time, end: dt.time) -> List[int]:
     """
@@ -538,15 +552,52 @@ async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("분봉은 1/3/5/10/15/30/60/240 중 하나여야 합니다.")
         return Q3_INTERVAL
+    context.user_data["bt_interval"] = interval
+    await update.message.reply_text(
+        "분석할 매입 시간대를 입력하세요 (예: 10:00~15:00, 전체: 전체)")
+    return Q3_BUY_WINDOW
 
+async def on_q3_buy_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text or text == "전체":
+        context.user_data["bt_buy_window"] = None
+    else:
+        window = parse_window_str(text)
+        if window is None:
+            await update.message.reply_text("형식은 HH:MM~HH:MM 입니다. (예: 10:00~15:00)")
+            return Q3_BUY_WINDOW
+        context.user_data["bt_buy_window"] = window
+    await update.message.reply_text(
+        "분석할 매각 시간대를 입력하세요 (예: 15:00~20:00, 전체: 전체)")
+    return Q3_SELL_WINDOW
+
+async def on_q3_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text or text == "전체":
+        sell_window = None
+    else:
+        window = parse_window_str(text)
+        if window is None:
+            await update.message.reply_text("형식은 HH:MM~HH:MM 입니다. (예: 15:00~20:00)")
+            return Q3_SELL_WINDOW
+        sell_window = window
     symbols = context.user_data["bt_symbols"]
     period = context.user_data["bt_period"]
+    interval = context.user_data["bt_interval"]
+    buy_window = context.user_data.get("bt_buy_window")
 
     await update.message.reply_text("백테스트 계산 중입니다. 다소 시간이 걸릴 수 있어요…")
     try:
         lines = ["[백테스트 결과]"]
         for sym in symbols:
-            res = await backtest_intraday(sym, period, interval_min=interval, budget_krw=DEFAULT_BUDGET)
+            res = await backtest_intraday(
+                sym,
+                period,
+                buy_window=buy_window,
+                sell_window=sell_window,
+                interval_min=interval,
+                budget_krw=DEFAULT_BUDGET,
+            )
             if "error" in res:
                 lines.append(f"{sym}: 오류 - {res['error']}")
                 continue
@@ -640,6 +691,8 @@ def build_app():
             Q3_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_symbol)],
             Q3_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_period)],
             Q3_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_interval)],
+            Q3_BUY_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_buy_window)],
+            Q3_SELL_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_sell_window)],
             Q4_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_symbol)],
             Q4_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_period)],
             Q4_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_interval)],
