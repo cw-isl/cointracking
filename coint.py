@@ -26,6 +26,11 @@ import datetime as dt
 import math
 import os
 import re
+import time
+import hmac
+import hashlib
+import base64
+from urllib.parse import urlencode
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -59,6 +64,9 @@ ALLOWED_USER_IDS: List[int] = []  # 예: [5517670242]
 UPBIT_BASE = "https://api.upbit.com"
 API_REQUEST_DELAY = 0.15  # seconds between Upbit API calls
 
+# Bithumb API
+BITHUMB_BASE = "https://api.bithumb.com"
+
 # 기본 백테스트 설정
 DEFAULT_INTERVAL_MIN = 5
 DEFAULT_BUDGET = 1_000_000  # 원
@@ -79,8 +87,16 @@ MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
     Q3_MACD,             # 기능3: MACD 사용 여부
     Q4_SYMBOL,           # 기능4: 시간대별 분석 종목
     Q4_PERIOD,           # 기능4: 기간
-    Q4_INTERVAL          # 기능4: 분봉
-) = range(12)
+    Q4_INTERVAL,         # 기능4: 분봉
+    BH_MENU,             # 빗썸 자동매매 메뉴
+    BH_API_KEY,          # 빗썸 API Key 입력
+    BH_API_SECRET,       # 빗썸 API Secret 입력
+    BH_TICKER,           # 빗썸 거래 티커 입력
+    BH_BUY_TIME,         # 매입 시간 입력
+    BH_BUY_PCT,          # 매입 퍼센트 입력
+    BH_SELL_TIME,        # 매각 시간 입력
+    BH_SELL_PCT          # 매각 퍼센트 입력
+) = range(20)
 
 # ========== 유틸 ==========
 def user_allowed(user_id: int) -> bool:
@@ -455,6 +471,7 @@ async def bts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("2) 거래액 Top10", callback_data="MENU_VAL")],
         [InlineKeyboardButton("3) 일일단가 수익률 비교 (백테스트)", callback_data="MENU_BT")],
         [InlineKeyboardButton("4) 시간대별 시세 분석", callback_data="MENU_TA")],
+        [InlineKeyboardButton("5) 빗썸 데일리 자동매매 설정", callback_data="MENU_BH")],
         [InlineKeyboardButton("닫기", callback_data="MENU_END")],
     ]
     if update.message:
@@ -482,6 +499,8 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "MENU_TA":
         await q.edit_message_text("종목을 입력하시오 (예: KRW-BTC)")
         return Q4_SYMBOL
+    elif data == "MENU_BH":
+        return await bh_show_menu(update, context)
     else:
         await q.edit_message_text("종료합니다.")
         return ConversationHandler.END
@@ -659,6 +678,187 @@ async def on_q3_macd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return await bts_menu(update, context)
 
+# ---- 빗썸 자동매매 섹션 ----
+
+async def bh_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "빗썸 자동매매 메뉴를 선택하세요:"):
+    kb = [
+        [InlineKeyboardButton("1. api입력", callback_data="BH_API")],
+        [InlineKeyboardButton("2. 거래설정", callback_data="BH_CONF")],
+        [InlineKeyboardButton("3. 거래시작", callback_data="BH_START")],
+        [InlineKeyboardButton("4. 거래중지", callback_data="BH_STOP")],
+        [InlineKeyboardButton("뒤로", callback_data="BH_BACK")],
+    ]
+    if update.message:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    return BH_MENU
+
+async def on_bh_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "BH_API":
+        await q.edit_message_text("AccessKey를 입력하세요")
+        return BH_API_KEY
+    elif data == "BH_CONF":
+        await q.edit_message_text("거래할 티커를 입력하세요 (예: BTC)")
+        return BH_TICKER
+    elif data == "BH_START":
+        required = ["b_api_key", "b_api_secret", "b_ticker", "b_buy_time", "b_buy_pct", "b_sell_time", "b_sell_pct"]
+        if not all(k in context.user_data for k in required):
+            await context.bot.send_message(update.effective_chat.id, "먼저 api입력과 거래설정을 완료하세요")
+        elif context.user_data.get("b_running"):
+            await context.bot.send_message(update.effective_chat.id, "이미 거래중입니다")
+        else:
+            await start_bithumb_trading(update, context)
+            await context.bot.send_message(update.effective_chat.id, "거래시작")
+        return await bh_show_menu(update, context)
+    elif data == "BH_STOP":
+        stop_bithumb_trading(context)
+        await context.bot.send_message(update.effective_chat.id, "거래중지")
+        return await bh_show_menu(update, context)
+    else:  # BH_BACK
+        return await bts_menu(update, context)
+
+async def on_bh_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["b_api_key"] = update.message.text.strip()
+    await update.message.reply_text("SecretKey를 입력하세요")
+    return BH_API_SECRET
+
+async def on_bh_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["b_api_secret"] = update.message.text.strip()
+    await update.message.reply_text("API 입력 완료")
+    return await bh_show_menu(update, context)
+
+async def on_bh_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().upper()
+    context.user_data["b_ticker"] = text
+    await update.message.reply_text("매입 시간을 입력하세요 (HH:MM)")
+    return BH_BUY_TIME
+
+async def on_bh_buy_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        parse_hhmm(update.message.text)
+    except Exception:
+        await update.message.reply_text("형식은 HH:MM 입니다. 다시 입력하세요")
+        return BH_BUY_TIME
+    context.user_data["b_buy_time"] = update.message.text.strip()
+    await update.message.reply_text("현 보유현금의 몇퍼센트를 매입할지 입력하세요 (예: 50)")
+    return BH_BUY_PCT
+
+async def on_bh_buy_pct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        pct = float(update.message.text.strip())
+    except Exception:
+        await update.message.reply_text("숫자로 입력해주세요")
+        return BH_BUY_PCT
+    context.user_data["b_buy_pct"] = pct
+    await update.message.reply_text("매각 시간을 입력하세요 (HH:MM)")
+    return BH_SELL_TIME
+
+async def on_bh_sell_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        parse_hhmm(update.message.text)
+    except Exception:
+        await update.message.reply_text("형식은 HH:MM 입니다. 다시 입력하세요")
+        return BH_SELL_TIME
+    context.user_data["b_sell_time"] = update.message.text.strip()
+    await update.message.reply_text("보유 코인의 몇퍼센트를 매각할지 입력하세요 (예: 50)")
+    return BH_SELL_PCT
+
+async def on_bh_sell_pct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        pct = float(update.message.text.strip())
+    except Exception:
+        await update.message.reply_text("숫자로 입력해주세요")
+        return BH_SELL_PCT
+    context.user_data["b_sell_pct"] = pct
+    await update.message.reply_text("거래설정 완료")
+    return await bh_show_menu(update, context)
+
+async def start_bithumb_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    buy_time = parse_hhmm(context.user_data["b_buy_time"])
+    sell_time = parse_hhmm(context.user_data["b_sell_time"])
+    data = {
+        "api_key": context.user_data["b_api_key"],
+        "api_secret": context.user_data["b_api_secret"],
+        "ticker": context.user_data["b_ticker"],
+        "buy_pct": context.user_data["b_buy_pct"],
+        "sell_pct": context.user_data["b_sell_pct"],
+        "chat_id": chat_id,
+    }
+    job_buy = context.job_queue.run_daily(bithumb_job_buy, time=buy_time, data=data, name=f"bh-buy-{chat_id}")
+    job_sell = context.job_queue.run_daily(bithumb_job_sell, time=sell_time, data=data, name=f"bh-sell-{chat_id}")
+    context.user_data["b_buy_job"] = job_buy
+    context.user_data["b_sell_job"] = job_sell
+    context.user_data["b_running"] = True
+
+def stop_bithumb_trading(context: ContextTypes.DEFAULT_TYPE):
+    for key in ("b_buy_job", "b_sell_job"):
+        job = context.user_data.get(key)
+        if job:
+            job.schedule_removal()
+            context.user_data[key] = None
+    context.user_data["b_running"] = False
+
+async def bithumb_private(session: aiohttp.ClientSession, endpoint: str, params: Dict[str, Any], access_key: str, secret_key: str) -> Dict[str, Any]:
+    url = BITHUMB_BASE + endpoint
+    nonce = str(int(time.time() * 1000))
+    qs = urlencode(params)
+    data = endpoint + "\0" + qs + "\0" + nonce
+    sign = hmac.new(secret_key.encode(), data.encode(), hashlib.sha512).digest()
+    headers = {
+        "Api-Key": access_key,
+        "Api-Sign": base64.b64encode(sign).decode(),
+        "Api-Nonce": nonce,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    async with session.post(url, data=qs, headers=headers) as resp:
+        return await resp.json()
+
+async def bithumb_public_ticker(session: aiohttp.ClientSession, ticker: str) -> Dict[str, Any]:
+    url = f"{BITHUMB_BASE}/public/ticker/{ticker}_KRW"
+    async with session.get(url) as resp:
+        return await resp.json()
+
+async def bithumb_job_buy(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    async with aiohttp.ClientSession() as session:
+        try:
+            bal = await bithumb_private(session, "/info/balance", {"currency": data["ticker"]}, data["api_key"], data["api_secret"])
+            available_krw = float(bal["data"].get("available_krw", 0))
+            krw_amount = available_krw * data["buy_pct"] / 100
+            ticker_res = await bithumb_public_ticker(session, data["ticker"])
+            price = float(ticker_res["data"]["closing_price"])
+            units = krw_amount / price if price else 0
+            await bithumb_private(session, "/trade/market_buy", {
+                "order_currency": data["ticker"],
+                "payment_currency": "KRW",
+                "units": f"{units:.8f}",
+            }, data["api_key"], data["api_secret"])
+            await context.bot.send_message(data["chat_id"], f"{data['ticker']} 매수 완료 ({units:.8f})")
+        except Exception as e:
+            await context.bot.send_message(data["chat_id"], f"매수 오류: {e}")
+
+async def bithumb_job_sell(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    async with aiohttp.ClientSession() as session:
+        try:
+            bal = await bithumb_private(session, "/info/balance", {"currency": data["ticker"]}, data["api_key"], data["api_secret"])
+            avail_key = f"available_{data['ticker'].lower()}"
+            available_coin = float(bal["data"].get(avail_key, 0))
+            units = available_coin * data["sell_pct"] / 100
+            await bithumb_private(session, "/trade/market_sell", {
+                "order_currency": data["ticker"],
+                "payment_currency": "KRW",
+                "units": f"{units:.8f}",
+            }, data["api_key"], data["api_secret"])
+            await context.bot.send_message(data["chat_id"], f"{data['ticker']} 매각 완료 ({units:.8f})")
+        except Exception as e:
+            await context.bot.send_message(data["chat_id"], f"매각 오류: {e}")
+
 # ---- 기능 4: 시간대별 시세 분석
 async def on_q4_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_allowed(update.effective_user.id):
@@ -737,6 +937,14 @@ def build_app():
             Q4_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_symbol)],
             Q4_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_period)],
             Q4_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_interval)],
+            BH_MENU: [CallbackQueryHandler(on_bh_menu)],
+            BH_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_api_key)],
+            BH_API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_api_secret)],
+            BH_TICKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_ticker)],
+            BH_BUY_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_buy_time)],
+            BH_BUY_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_buy_pct)],
+            BH_SELL_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_sell_time)],
+            BH_SELL_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_bh_sell_pct)],
         },
         fallbacks=[CommandHandler("bts", bts_menu)],
         name="bts-conv",
