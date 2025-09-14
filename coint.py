@@ -27,9 +27,9 @@ import math
 import os
 import re
 import time
-import hmac
 import hashlib
-import base64
+import uuid
+import jwt
 from urllib.parse import urlencode
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
@@ -803,42 +803,57 @@ def stop_bithumb_trading(context: ContextTypes.DEFAULT_TYPE):
             context.user_data[key] = None
     context.user_data["b_running"] = False
 
-async def bithumb_private(session: aiohttp.ClientSession, endpoint: str, params: Dict[str, Any], access_key: str, secret_key: str) -> Dict[str, Any]:
+async def bithumb_private(
+    session: aiohttp.ClientSession,
+    endpoint: str,
+    params: Dict[str, Any],
+    access_key: str,
+    secret_key: str,
+    method: str = "POST",
+) -> Dict[str, Any]:
     url = BITHUMB_BASE + endpoint
-    nonce = str(int(time.time() * 1000))
-    qs = urlencode(params)
-    data = endpoint + "\0" + qs + "\0" + nonce
-    sign = hmac.new(secret_key.encode(), data.encode(), hashlib.sha512).digest()
-    headers = {
-        "Api-Key": access_key,
-        "Api-Sign": base64.b64encode(sign).decode(),
-        "Api-Nonce": nonce,
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    async with session.post(url, data=qs, headers=headers) as resp:
-        return await resp.json()
+    query = urlencode(params).encode()
+    m = hashlib.sha512()
+    m.update(query)
+    query_hash = m.hexdigest()
 
-async def bithumb_public_ticker(session: aiohttp.ClientSession, ticker: str) -> Dict[str, Any]:
-    url = f"{BITHUMB_BASE}/public/ticker/{ticker}_KRW"
-    async with session.get(url) as resp:
-        return await resp.json()
+    payload = {
+        "access_key": access_key,
+        "nonce": str(uuid.uuid4()),
+        "timestamp": str(int(time.time() * 1000)),
+        "query_hash": query_hash,
+        "query_hash_alg": "SHA512",
+    }
+
+    jwt_token = jwt.encode(payload, secret_key, algorithm="HS256")
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+
+    if method == "GET":
+        async with session.get(url, headers=headers, params=params) as resp:
+            return await resp.json()
+    else:
+        async with session.post(url, headers=headers, json=params) as resp:
+            return await resp.json()
 
 async def bithumb_job_buy(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     async with aiohttp.ClientSession() as session:
         try:
-            bal = await bithumb_private(session, "/info/balance", {"currency": data["ticker"]}, data["api_key"], data["api_secret"])
-            available_krw = float(bal["data"].get("available_krw", 0))
+            bal = await bithumb_private(session, "/v1/accounts", {}, data["api_key"], data["api_secret"], method="GET")
+            available_krw = 0.0
+            for acc in bal:
+                if acc.get("currency") == "KRW":
+                    available_krw = float(acc.get("balance", 0))
+                    break
             krw_amount = available_krw * data["buy_pct"] / 100
-            ticker_res = await bithumb_public_ticker(session, data["ticker"])
-            price = float(ticker_res["data"]["closing_price"])
-            units = krw_amount / price if price else 0
-            await bithumb_private(session, "/trade/market_buy", {
-                "order_currency": data["ticker"],
-                "payment_currency": "KRW",
-                "units": f"{units:.8f}",
-            }, data["api_key"], data["api_secret"])
-            await context.bot.send_message(data["chat_id"], f"{data['ticker']} 매수 완료 ({units:.8f})")
+            params = {
+                "market": f"KRW-{data['ticker']}",
+                "side": "bid",
+                "ord_type": "price",
+                "price": str(int(krw_amount)),
+            }
+            await bithumb_private(session, "/v1/orders", params, data["api_key"], data["api_secret"], method="POST")
+            await context.bot.send_message(data["chat_id"], f"{data['ticker']} 매수 완료 (KRW {krw_amount:.0f})")
         except Exception as e:
             await context.bot.send_message(data["chat_id"], f"매수 오류: {e}")
 
@@ -846,15 +861,20 @@ async def bithumb_job_sell(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     async with aiohttp.ClientSession() as session:
         try:
-            bal = await bithumb_private(session, "/info/balance", {"currency": data["ticker"]}, data["api_key"], data["api_secret"])
-            avail_key = f"available_{data['ticker'].lower()}"
-            available_coin = float(bal["data"].get(avail_key, 0))
+            bal = await bithumb_private(session, "/v1/accounts", {}, data["api_key"], data["api_secret"], method="GET")
+            available_coin = 0.0
+            for acc in bal:
+                if acc.get("currency") == data["ticker"]:
+                    available_coin = float(acc.get("balance", 0))
+                    break
             units = available_coin * data["sell_pct"] / 100
-            await bithumb_private(session, "/trade/market_sell", {
-                "order_currency": data["ticker"],
-                "payment_currency": "KRW",
-                "units": f"{units:.8f}",
-            }, data["api_key"], data["api_secret"])
+            params = {
+                "market": f"KRW-{data['ticker']}",
+                "side": "ask",
+                "ord_type": "market",
+                "volume": f"{units:.8f}",
+            }
+            await bithumb_private(session, "/v1/orders", params, data["api_key"], data["api_secret"], method="POST")
             await context.bot.send_message(data["chat_id"], f"{data['ticker']} 매각 완료 ({units:.8f})")
         except Exception as e:
             await context.bot.send_message(data["chat_id"], f"매각 오류: {e}")
