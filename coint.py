@@ -11,6 +11,7 @@
      - 분봉(1/3/5/10/15/30/60/240)
      - 기간 동안 하루 중 평균적으로 가장 낮은 시각과 가장 높은 시각을 자동 탐색하여,
        매일 같은 시각에 전액 매수/매도했다면 결과(Upbit 수수료 및 시중은행 금리 비교)를 계산
+  4) 시간대별 평균 시세 분석
 명령:
   /bts  : 메뉴 시작 (선택형)
   /start: 안내
@@ -26,7 +27,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 
 import aiohttp
 import pandas as pd
@@ -72,8 +73,13 @@ MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
     Q2_PERIOD,           # 기능2: 거래액 기간
     Q3_SYMBOL,           # 기능3: 종목
     Q3_PERIOD,           # 기능3: 기간
-    Q3_INTERVAL          # 기능3: 분봉
-) = range(6)
+    Q3_INTERVAL,         # 기능3: 분봉
+    Q4_SYMBOL,           # 기능4: 시간대별 분석 종목
+    Q4_PERIOD,           # 기능4: 기간
+    Q4_INTERVAL,         # 기능4: 분봉
+    Q4_BUY_WINDOW,       # 기능4: 매입 시간대
+    Q4_SELL_WINDOW       # 기능4: 매각 시간대
+) = range(11)
 
 # ========== 유틸 ==========
 def user_allowed(user_id: int) -> bool:
@@ -224,6 +230,62 @@ def _window_to_minutes(window: Tuple[str, str]) -> List[int]:
     e = parse_hhmm(window[1])
     return time_range_minutes(s, e)
 
+async def analyze_time_of_day(
+    market: str,
+    period_days: int,
+    interval_min: int = DEFAULT_INTERVAL_MIN,
+    buy_window: Optional[Tuple[str, str]] = None,
+    sell_window: Optional[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+    """주어진 기간 동안 분봉 데이터를 이용해 하루 중 평균적으로
+    가장 낮은 시각과 가장 높은 시각을 계산한다.
+
+    buy_window 또는 sell_window가 주어지면 해당 시간대 내에서만 최저/최고
+    평균 시각을 탐색한다.
+    """
+    end = tz_now()
+    need_minutes = period_days * int(24 * 60 / interval_min) + 400
+    async with aiohttp.ClientSession() as session:
+        df = await fetch_minute_candles(session, market, interval_min, end, need_minutes)
+    if df.empty:
+        return {"error": "분봉 데이터를 가져오지 못했습니다."}
+
+    df["min_of_day"] = df["time_kst"].apply(lambda x: _minutes_of_day(pd.Timestamp(x)))
+    df["date"] = df["time_kst"].dt.tz_convert("Asia/Seoul").dt.date
+
+    first_day = (end - dt.timedelta(days=period_days)).date()
+    df = df[df["date"] >= first_day]
+    if df.empty:
+        return {"error": "해당 기간의 분봉 데이터가 없습니다."}
+
+    def round_to_interval(m):
+        return (m // interval_min) * interval_min
+
+    df["bucket_min"] = df["min_of_day"].apply(round_to_interval)
+    avg_price = df.groupby("bucket_min")["close"].mean()
+    if avg_price.empty:
+        return {"error": "데이터가 부족합니다."}
+
+    buy_candidates = list(range(0, 24 * 60)) if buy_window is None else _window_to_minutes(buy_window)
+    sell_candidates = list(range(0, 24 * 60)) if sell_window is None else _window_to_minutes(sell_window)
+
+    buy_avg = avg_price[avg_price.index.isin(buy_candidates)].sort_values()
+    sell_avg = avg_price[avg_price.index.isin(sell_candidates)].sort_values(ascending=False)
+    if buy_avg.empty or sell_avg.empty:
+        return {"error": "지정한 시간대에 데이터가 충분하지 않습니다."}
+
+    best_buy_min = int(buy_avg.index[0])
+    best_sell_min = int(sell_avg.index[0])
+    return {
+        "market": market,
+        "period_days": period_days,
+        "interval_min": interval_min,
+        "best_buy_min": best_buy_min,
+        "best_sell_min": best_sell_min,
+        "buy_time_str": f"{best_buy_min//60:02d}:{best_buy_min%60:02d}",
+        "sell_time_str": f"{best_sell_min//60:02d}:{best_sell_min%60:02d}",
+    }
+
 async def backtest_intraday(
     market: str,
     period_days: int,
@@ -367,6 +429,7 @@ async def bts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("1) 변동성 Top10", callback_data="MENU_VOL")],
         [InlineKeyboardButton("2) 거래액 Top10", callback_data="MENU_VAL")],
         [InlineKeyboardButton("3) 일일단가 수익률 비교 (백테스트)", callback_data="MENU_BT")],
+        [InlineKeyboardButton("4) 시간대별 시세 분석", callback_data="MENU_TA")],
         [InlineKeyboardButton("닫기", callback_data="MENU_END")],
     ]
     if update.message:
@@ -391,6 +454,9 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "MENU_BT":
         await q.edit_message_text("종목을 입력하시오 (예: KRW-BTC, KRW-ETH)")
         return Q3_SYMBOL
+    elif data == "MENU_TA":
+        await q.edit_message_text("종목을 입력하시오 (예: KRW-BTC)")
+        return Q4_SYMBOL
     else:
         await q.edit_message_text("종료합니다.")
         return ConversationHandler.END
@@ -518,6 +584,114 @@ async def on_q3_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return await bts_menu(update, context)
 
+# ---- 기능 4: 시간대별 시세 분석
+async def on_q4_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not user_allowed(update.effective_user.id):
+        return ConversationHandler.END
+    text = update.message.text.strip().upper()
+    if not text:
+        await update.message.reply_text("종목을 입력해주세요 (예: KRW-BTC)")
+        return Q4_SYMBOL
+    if not text.startswith("KRW-"):
+        text = f"KRW-{text}"
+    context.user_data["ta_symbol"] = text
+    await update.message.reply_text("조회기간(일)을 입력하시오 (예: 200)")
+    return Q4_PERIOD
+
+async def on_q4_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        period = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("숫자로 입력해주세요. (예: 200)")
+        return Q4_PERIOD
+    context.user_data["ta_period"] = period
+    await update.message.reply_text(
+        f"분봉(1/3/5/10/15/30/60/240)을 입력하시오 (기본: {DEFAULT_INTERVAL_MIN})",
+    )
+    return Q4_INTERVAL
+
+async def on_q4_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        interval = int(update.message.text.strip())
+        if interval not in [1,3,5,10,15,30,60,240]:
+            raise ValueError
+    except:
+        await update.message.reply_text("분봉은 1/3/5/10/15/30/60/240 중 하나여야 합니다.")
+        return Q4_INTERVAL
+    context.user_data["ta_interval"] = interval
+    await update.message.reply_text(
+        "분석할 매입 시간대를 입력하세요 (예: 10:00~15:00, 전체는 그냥 엔터)"
+    )
+    return Q4_BUY_WINDOW
+
+async def on_q4_buy_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text:
+        m = re.match(r"^(\d{1,2}:\d{2})\s*~\s*(\d{1,2}:\d{2})$", text)
+        if not m:
+            await update.message.reply_text("형식은 HH:MM~HH:MM 입니다. 다시 입력하세요.")
+            return Q4_BUY_WINDOW
+        try:
+            parse_hhmm(m.group(1))
+            parse_hhmm(m.group(2))
+        except:
+            await update.message.reply_text("시간 형식이 잘못되었습니다. 다시 입력하세요.")
+            return Q4_BUY_WINDOW
+        context.user_data["ta_buy_window"] = (m.group(1), m.group(2))
+    else:
+        context.user_data["ta_buy_window"] = None
+    await update.message.reply_text(
+        "분석할 매각 시간대를 입력하세요 (예: 15:00~20:00, 전체는 그냥 엔터)"
+    )
+    return Q4_SELL_WINDOW
+
+async def on_q4_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text:
+        m = re.match(r"^(\d{1,2}:\d{2})\s*~\s*(\d{1,2}:\d{2})$", text)
+        if not m:
+            await update.message.reply_text("형식은 HH:MM~HH:MM 입니다. 다시 입력하세요.")
+            return Q4_SELL_WINDOW
+        try:
+            parse_hhmm(m.group(1))
+            parse_hhmm(m.group(2))
+        except:
+            await update.message.reply_text("시간 형식이 잘못되었습니다. 다시 입력하세요.")
+            return Q4_SELL_WINDOW
+        context.user_data["ta_sell_window"] = (m.group(1), m.group(2))
+    else:
+        context.user_data["ta_sell_window"] = None
+
+    symbol = context.user_data["ta_symbol"]
+    period = context.user_data["ta_period"]
+    interval = context.user_data["ta_interval"]
+    buy_w = context.user_data.get("ta_buy_window")
+    sell_w = context.user_data.get("ta_sell_window")
+
+    await update.message.reply_text("시간대별 시세 분석 중입니다. 잠시만요…")
+    try:
+        res = await analyze_time_of_day(
+            symbol,
+            period,
+            interval_min=interval,
+            buy_window=buy_w,
+            sell_window=sell_w,
+        )
+        if "error" in res:
+            await update.message.reply_text(f"오류: {res['error']}")
+        else:
+            msg = (
+                f"종목: {res['market']}\n"
+                f"기간: {res['period_days']}일, 분봉: {res['interval_min']}분\n"
+                f"평균 최저가 시각: {res['buy_time_str']}\n"
+                f"평균 최고가 시각: {res['sell_time_str']}"
+            )
+            await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"오류: {e}")
+
+    return await bts_menu(update, context)
+
 # ========== 앱 구동 ==========
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -534,6 +708,11 @@ def build_app():
             Q3_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_symbol)],
             Q3_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_period)],
             Q3_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_interval)],
+            Q4_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_symbol)],
+            Q4_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_period)],
+            Q4_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_interval)],
+            Q4_BUY_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_buy_window)],
+            Q4_SELL_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_sell_window)],
         },
         fallbacks=[CommandHandler("bts", bts_menu)],
         name="bts-conv",
