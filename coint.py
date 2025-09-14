@@ -76,10 +76,11 @@ MAX_CANDLE_COUNT = 200  # Upbit 분봉/일봉 요청 최대 200
     Q3_INTERVAL,         # 기능3: 분봉
     Q3_BUY_WINDOW,       # 기능3: 매입 시간대
     Q3_SELL_WINDOW,      # 기능3: 매각 시간대
+    Q3_MACD,             # 기능3: MACD 사용 여부
     Q4_SYMBOL,           # 기능4: 시간대별 분석 종목
     Q4_PERIOD,           # 기능4: 기간
     Q4_INTERVAL          # 기능4: 분봉
-) = range(11)
+) = range(12)
 
 # ========== 유틸 ==========
 def user_allowed(user_id: int) -> bool:
@@ -293,6 +294,7 @@ async def backtest_intraday(
     budget_krw: int = DEFAULT_BUDGET,
     fee_rate: float = DEFAULT_FEE_RATE,
     bank_rate: float = DEFAULT_BANK_RATE,
+    use_macd: bool = False,
 ) -> Dict:
     """
     1) 기간 동안 '분봉 close'를 일자별로 분해
@@ -306,6 +308,9 @@ async def backtest_intraday(
     need_minutes = period_days * int(24*60/interval_min) + 400  # 버퍼
     async with aiohttp.ClientSession() as session:
         df = await fetch_minute_candles(session, market, interval_min, end, need_minutes)
+        daily_df = None
+        if use_macd:
+            daily_df = await fetch_daily_candles(session, market, period_days + 20)
     if df.empty:
         return {"error": "분봉 데이터를 가져오지 못했습니다."}
 
@@ -365,6 +370,28 @@ async def backtest_intraday(
 
     # 교집합 날짜로 수익률 산출
     days = sorted(set(buy_price_by_day.index).intersection(set(sell_price_by_day.index)))
+
+    if use_macd:
+        if daily_df is None or daily_df.empty:
+            return {"error": "MACD 계산을 위한 일봉 데이터를 가져오지 못했습니다."}
+        daily_df = daily_df.sort_values("date_kst")
+        daily_df["ma10"] = daily_df["close"].rolling(10).mean()
+        daily_df["ma20"] = daily_df["close"].rolling(20).mean()
+        daily_df["signal"] = daily_df["ma10"] > daily_df["ma20"]
+        daily_df["cross_up"] = daily_df["signal"] & (~daily_df["signal"].shift(1).fillna(False))
+        macd_active = False
+        macd_ok = []
+        for sig, cross in zip(daily_df["signal"], daily_df["cross_up"]):
+            if cross:
+                macd_active = True
+            if not sig:
+                macd_active = False
+            macd_ok.append(macd_active)
+        daily_df["macd_ok"] = macd_ok
+        allowed_days = set(daily_df[daily_df["macd_ok"]]["date_kst"].dt.date)
+        days = [d for d in days if d in allowed_days]
+        if not days:
+            return {"error": "MACD 조건을 충족하는 거래일이 없습니다."}
     results = []
     capital = budget_krw  # 재투자 시작자본
     cum_capitals = []     # 재투자 궤적
@@ -581,10 +608,20 @@ async def on_q3_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("형식은 HH:MM~HH:MM 입니다. (예: 15:00~20:00)")
             return Q3_SELL_WINDOW
         sell_window = window
+    context.user_data["bt_sell_window"] = sell_window
+    await update.message.reply_text("MACD 조건을 적용하시겠습니까? (y/n)")
+    return Q3_MACD
+
+async def on_q3_macd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    use_macd = text in ["y", "yes", "예", "네"]
+    context.user_data["bt_use_macd"] = use_macd
+
     symbols = context.user_data["bt_symbols"]
     period = context.user_data["bt_period"]
     interval = context.user_data["bt_interval"]
     buy_window = context.user_data.get("bt_buy_window")
+    sell_window = context.user_data.get("bt_sell_window")
 
     await update.message.reply_text("백테스트 계산 중입니다. 다소 시간이 걸릴 수 있어요…")
     try:
@@ -597,6 +634,7 @@ async def on_q3_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sell_window=sell_window,
                 interval_min=interval,
                 budget_krw=DEFAULT_BUDGET,
+                use_macd=use_macd,
             )
             if "error" in res:
                 lines.append(f"{sym}: 오류 - {res['error']}")
@@ -611,6 +649,8 @@ async def on_q3_sell_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"은행 수익률: {res['bank_profit_pct']:.2f}%\n"
                 f"승률: {res['win_rate_pct']:.2f}%"
             )
+            if use_macd:
+                msg += "\n(MACD 조건 적용)"
             lines.append(msg)
             lines.append("")
         await update.message.reply_text("\n".join(lines).strip())
@@ -693,6 +733,7 @@ def build_app():
             Q3_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_interval)],
             Q3_BUY_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_buy_window)],
             Q3_SELL_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_sell_window)],
+            Q3_MACD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q3_macd)],
             Q4_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_symbol)],
             Q4_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_period)],
             Q4_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_q4_interval)],
